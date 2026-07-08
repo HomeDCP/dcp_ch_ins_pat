@@ -1,0 +1,34 @@
+# ───── macOS ─────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ───── Xcode ─────
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager
+.build/
+Package.resolved
+
+# ───── 서명/비밀정보 (커밋 금지) ─────
+*.mobileprovision
+*.provisionprofile
+*.p12
+*.cer
+*.certSigningRequest
+secrets/
+*.xcconfig.local
+
+# ───── 기타 ─────
+*.log
+.env

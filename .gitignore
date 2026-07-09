@@ -29,6 +29,10 @@ Package.resolved
 secrets/
 *.xcconfig.local
 
+# ───── 로컬 도구 설정 (커밋 제외) ─────
+.claude/
+*.local.json
+
 # ───── 기타 ─────
 *.log
 .env

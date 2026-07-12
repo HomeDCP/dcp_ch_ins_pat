@@ -1,0 +1,985 @@
+diff --git a/src/tools/dcpomatic_player.cc b/src/tools/dcpomatic_player.cc
+index 688decc..2e0f30e 100644
+--- a/src/tools/dcpomatic_player.cc
++++ b/src/tools/dcpomatic_player.cc
+@@ -32,6 +32,7 @@
+ #include "wx/report_problem_dialog.h"
+ #include "wx/standard_controls.h"
+ #include "wx/system_information_dialog.h"
++#include "wx/channel_inspector_dialog.h"
+ #include "wx/timer_display.h"
+ #include "wx/update_dialog.h"
+ #include "wx/verify_dcp_dialog.h"
+@@ -129,6 +130,7 @@ enum {
+ 	/* Allow spare IDs for CPLs */
+ 	ID_view_full_screen = DCPOMATIC_MAIN_MENU + 200,
+ 	ID_view_dual_screen,
++	ID_view_room_eq,
+ 	ID_view_closed_captions,
+ 	ID_view_eye,
+ 	ID_view_eye_left,
+@@ -143,6 +145,7 @@ enum {
+ 	ID_tools_check_for_updates,
+ 	ID_tools_timing,
+ 	ID_tools_system_information,
++	ID_tools_channel_inspector,
+ 	/* IDs for shortcuts (with no associated menu item) */
+ 	ID_start_stop,
+ 	ID_go_back_frame,
+@@ -239,6 +242,7 @@ public:
+ 		Bind(wxEVT_MENU, boost::bind(&DOMFrame::edit_preferences, this), wxID_PREFERENCES);
+ 		Bind(wxEVT_MENU, boost::bind(&DOMFrame::view_full_screen, this), ID_view_full_screen);
+ 		Bind(wxEVT_MENU, boost::bind(&DOMFrame::view_dual_screen, this), ID_view_dual_screen);
++		Bind(wxEVT_MENU, boost::bind(&DOMFrame::view_room_eq, this, _1), ID_view_room_eq);
+ 		Bind(wxEVT_MENU, boost::bind(&DOMFrame::view_closed_captions, this), ID_view_closed_captions);
+ 		Bind(wxEVT_MENU, boost::bind(&DOMFrame::view_cpl, this, _1), ID_view_cpl, ID_view_cpl + MAX_CPLS);
+ 		Bind(wxEVT_MENU, boost::bind(&DOMFrame::view_eye_changed, this, _1), ID_view_eye_left);
+@@ -253,6 +257,7 @@ public:
+ 		Bind(wxEVT_MENU, boost::bind(&DOMFrame::tools_check_for_updates, this), ID_tools_check_for_updates);
+ 		Bind(wxEVT_MENU, boost::bind(&DOMFrame::tools_timing, this), ID_tools_timing);
+ 		Bind(wxEVT_MENU, boost::bind(&DOMFrame::tools_system_information, this), ID_tools_system_information);
++		Bind(wxEVT_MENU, boost::bind(&DOMFrame::tools_channel_inspector, this), ID_tools_channel_inspector);
+ 
+ 		Bind(wxEVT_CLOSE_WINDOW, boost::bind(&DOMFrame::close, this, _1));
+ 
+@@ -717,6 +722,7 @@ private:
+ 		view->AppendSeparator();
+ 		_view_full_screen = view->AppendCheckItem(ID_view_full_screen, _("Full screen\tF11"));
+ 		_view_dual_screen = view->AppendCheckItem(ID_view_dual_screen, _("Dual screen\tShift+F11"));
++		view->AppendCheckItem(ID_view_room_eq, _("Room EQ (test)"));
+ 		setup_menu();
+ 		view->AppendSeparator();
+ 		view->Append(ID_view_closed_captions, _("Closed captions..."));
+@@ -737,6 +743,7 @@ private:
+ 		tools->Append(ID_tools_check_for_updates, _("Check for updates"));
+ 		tools->Append(ID_tools_timing, _("Timing..."));
+ 		tools->Append(ID_tools_system_information, _("System information..."));
++		tools->Append(ID_tools_channel_inspector, _("Channel inspector..."));
+ 
+ 		auto help = new wxMenu;
+ #ifdef __WXOSX__
+@@ -951,6 +958,12 @@ private:
+ 		setup_menu();
+ 	}
+ 
++	void view_room_eq(wxCommandEvent& ev)
++	{
++		/* RoomTune: 재생 경로 룸 EQ 토글 */
++		_viewer.set_room_eq_enabled(ev.IsChecked());
++	}
++
+ 	void view_dual_screen()
+ 	{
+ 		if (_mode == Config::PlayerMode::DUAL) {
+@@ -1079,6 +1092,15 @@ private:
+ 		_system_information_dialog->Show();
+ 	}
+ 
++	void tools_channel_inspector()
++	{
++		if (!_channel_inspector_dialog) {
++			_channel_inspector_dialog.reset(this, _viewer);
++		}
++
++		_channel_inspector_dialog->Show();
++	}
++
+ 	void help_about()
+ 	{
+ 		AboutDialog dialog(this);
+@@ -1301,6 +1323,7 @@ private:
+ 	FilmViewer _viewer;
+ 	Controls* _controls;
+ 	wx_ptr<SystemInformationDialog> _system_information_dialog;
++	wx_ptr<ChannelInspectorDialog> _channel_inspector_dialog;
+ 	std::shared_ptr<Film> _film;
+ 	boost::signals2::scoped_connection _config_changed_connection;
+ 	boost::signals2::scoped_connection _examine_job_connection;
+diff --git a/src/wx/biquad.h b/src/wx/biquad.h
+new file mode 100644
+index 0000000..064f928
+--- /dev/null
++++ b/src/wx/biquad.h
+@@ -0,0 +1,90 @@
++/*
++    RoomTune — 공유 biquad DSP 코어 (RBJ Audio EQ Cookbook)
++    DCP-o-matic 파생물 (GPL-2.0-or-later).
++
++    room_eq.h(재생 룸튜닝 EQ)와 channel_inspector.h(검수용 채널 인스펙터)가
++    공유하는 순수 DSP 코어. wx/DCP-o-matic 의존 없음 → 헤드리스 단위테스트 가능.
++
++    계수는 모두 Q 로 매개변수화(REW / EQ APO 파라메트릭과 일치). 부스트 상한·프리앰프
++    등 정책 규칙은 각 소비자(room_eq.h 등)가 적용한다 — 이 파일은 순수 필터 계수만.
++*/
++
++#ifndef DCPOMATIC_BIQUAD_H
++#define DCPOMATIC_BIQUAD_H
++
++#include <cmath>
++
++namespace roomtune {
++
++/** biquad 상태(채널·밴드별로 하나씩). */
++struct BiquadState { double z1 = 0; double z2 = 0; };
++
++/** Transposed Direct Form II biquad (정규화된 계수, a0 = 1). */
++struct Biquad {
++	double b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
++	inline double process(BiquadState& s, double x) const {
++		double const y = b0 * x + s.z1;
++		s.z1 = b1 * x - a1 * y + s.z2;
++		s.z2 = b2 * x - a2 * y;
++		return y;
++	}
++};
++
++inline Biquad normalise(double b0, double b1, double b2, double a0, double a1, double a2) {
++	Biquad q;
++	q.b0 = b0 / a0; q.b1 = b1 / a0; q.b2 = b2 / a0;
++	q.a1 = a1 / a0; q.a2 = a2 / a0;
++	return q;
++}
++
++/* RBJ peaking EQ (Q 기반 — REW/EQ APO 파라메트릭과 일치) */
++inline Biquad peaking(double fc, double Q, double gain_db, double fs) {
++	double const A = std::pow(10.0, gain_db / 40.0);
++	double const w0 = 2.0 * M_PI * fc / fs;
++	double const cw = std::cos(w0), sw = std::sin(w0);
++	double const al = sw / (2.0 * Q);
++	return normalise(1 + al * A, -2 * cw, 1 - al * A,
++	                 1 + al / A, -2 * cw, 1 - al / A);
++}
++
++/* Q 로 매개변수화한 RBJ 셸프 (low=true → low-shelf, false → high-shelf) */
++inline Biquad shelf(double fc, double Q, double gain_db, double fs, bool low) {
++	double const A = std::pow(10.0, gain_db / 40.0);
++	double const w0 = 2.0 * M_PI * fc / fs;
++	double const cw = std::cos(w0), sw = std::sin(w0);
++	double const al = sw / (2.0 * Q);
++	double const t = 2.0 * std::sqrt(A) * al;
++	if (low) {
++		return normalise(
++			A * ((A + 1) - (A - 1) * cw + t),
++			2 * A * ((A - 1) - (A + 1) * cw),
++			A * ((A + 1) - (A - 1) * cw - t),
++			(A + 1) + (A - 1) * cw + t,
++			-2 * ((A - 1) + (A + 1) * cw),
++			(A + 1) + (A - 1) * cw - t);
++	}
++	return normalise(
++		A * ((A + 1) + (A - 1) * cw + t),
++		-2 * A * ((A - 1) + (A + 1) * cw),
++		A * ((A + 1) + (A - 1) * cw - t),
++		(A + 1) - (A - 1) * cw + t,
++		2 * ((A - 1) - (A + 1) * cw),
++		(A + 1) - (A - 1) * cw - t);
++}
++
++/* RBJ 2차 LPF/HPF (Q 기반) */
++inline Biquad pass(double fc, double Q, double fs, bool low) {
++	double const w0 = 2.0 * M_PI * fc / fs;
++	double const cw = std::cos(w0), sw = std::sin(w0);
++	double const al = sw / (2.0 * Q);
++	if (low) {
++		return normalise((1 - cw) / 2, 1 - cw, (1 - cw) / 2,
++		                 1 + al, -2 * cw, 1 - al);
++	}
++	return normalise((1 + cw) / 2, -(1 + cw), (1 + cw) / 2,
++	                 1 + al, -2 * cw, 1 - al);
++}
++
++} // namespace roomtune
++
++#endif
+diff --git a/src/wx/channel_inspector.h b/src/wx/channel_inspector.h
+new file mode 100644
+index 0000000..9a33ecb
+--- /dev/null
++++ b/src/wx/channel_inspector.h
+@@ -0,0 +1,135 @@
++/*
++    RoomTune — DCP 검수용 오디오 채널 인스펙터 (실시간 엔진, 비-UI)
++    DCP-o-matic 파생물 (GPL-2.0-or-later).
++
++    DCP 재생 검수 시 채널 매핑을 실측 검증하는 엔진.
++      • 채널별 solo/mute — 개별 채널을 격리/소거하여 매핑 확인
++      • 채널별 피크 미터 — 각 DCP 채널에 실제 신호가 오는지 확인
++      • 무할당 다운믹스 매트릭스 — DCP 레이아웃(N ch) → 출력 장치(dev ch) 라우팅
++
++    v1 범위: 위 3가지(채널 검수 코어). 진단 EQ 프리셋은 다음 반복(biquad.h 공유 예정).
++
++    스레드 모델(SPSC):
++      • GUI(단일 writer): configure/set_solo/set_mute/clear/publish
++      • RtAudio 콜백(단일 reader): mid_buffer/meter/downmix
++      라우팅 매트릭스는 더블버퍼 + atomic 인덱스로 lock-free 발행한다.
++      콜백 경로(meter/downmix)는 힙 할당·락·예외 없음(noexcept).
++*/
++
++#ifndef DCPOMATIC_CHANNEL_INSPECTOR_H
++#define DCPOMATIC_CHANNEL_INSPECTOR_H
++
++#include <atomic>
++#include <vector>
++#include <cstddef>
++#include <cmath>
++#include <algorithm>
++
++class ChannelInspector
++{
++public:
++	static int const MAX_DCP = 16;   /* DCP 오디오 채널 상한(MAX_DCP_AUDIO_CHANNELS) */
++	static int const MAX_DEV = 16;   /* 출력 장치 채널 상한 */
++
++	ChannelInspector() {
++		for (int i = 0; i < MAX_DCP; ++i) _peak[i].store(0.0f, std::memory_order_relaxed);
++		zero_matrix(_matrix[0]);
++		zero_matrix(_matrix[1]);
++	}
++
++	/** 라우팅 게인 매트릭스: g[dcp_src][dev_out]. trivially copyable(atomic 아님). */
++	struct MatrixSrc { float g[MAX_DCP][MAX_DEV]; };
++
++	/* ───────── 구성 (GUI 스레드, 콜백 suspend 중에만) ───────── */
++
++	/** 중간버퍼 재할당 + 상태 리셋. dcp_channels=DCP 채널수, dev_channels=출력장치 채널수. */
++	void configure(int dcp_channels, int dev_channels, unsigned int block_size) {
++		_dcp_ch = std::max(0, std::min(dcp_channels, MAX_DCP));
++		_dev_ch = std::max(0, std::min(dev_channels, MAX_DEV));
++		_block  = block_size;
++		_mid.assign(static_cast<std::size_t>(block_size) * MAX_DCP, 0.0f);
++		for (int i = 0; i < MAX_DCP; ++i) _peak[i].store(0.0f, std::memory_order_relaxed);
++	}
++
++	bool active_pipeline() const { return _dcp_ch > 0 && _dev_ch > 0 && !_mid.empty(); }
++	int  dcp_channels() const { return _dcp_ch; }
++	int  dev_channels() const { return _dev_ch; }
++
++	/* ───────── 콜백 (오디오 스레드, 무할당·noexcept) ───────── */
++
++	/** DCP 레이아웃 오디오를 담을 사전할당 중간버퍼(≥ frames*MAX_DCP). */
++	float* mid_buffer(unsigned int /*frames*/) noexcept { return _mid.data(); }
++
++	/** 채널별 피크(다운믹스/뮤트 이전, 원신호 기준)를 atomic 으로 기록. */
++	void meter(float const* mid, unsigned int frames) noexcept {
++		int const dcp = _dcp_ch;
++		for (int c = 0; c < dcp; ++c) {
++			float pk = 0.0f;
++			for (unsigned int f = 0; f < frames; ++f) {
++				float const v = std::fabs(mid[static_cast<std::size_t>(f) * dcp + c]);
++				if (v > pk) pk = v;
++			}
++			_peak[c].store(pk, std::memory_order_relaxed);
++		}
++	}
++
++	/** 무할당 다운믹스: mid(dcp ch 인터리브) → out(dev ch 인터리브), M 스냅샷 적용. */
++	void downmix(float const* mid, float* out, unsigned int frames) const noexcept {
++		int const idx = _pub.load(std::memory_order_acquire);
++		MatrixSrc const& M = _matrix[idx];
++		int const dcp = _dcp_ch, dev = _dev_ch;
++		for (unsigned int f = 0; f < frames; ++f) {
++			float const* in = mid + static_cast<std::size_t>(f) * dcp;
++			float* o = out + static_cast<std::size_t>(f) * dev;
++			for (int j = 0; j < dev; ++j) o[j] = 0.0f;
++			for (int c = 0; c < dcp; ++c) {
++				float const s = in[c];
++				float const* row = M.g[c];
++				for (int j = 0; j < dev; ++j) {
++					float const g = row[j];
++					if (g != 0.0f) o[j] += s * g;
++				}
++			}
++		}
++	}
++
++	/* ───────── 상태 (GUI 스레드) ───────── */
++
++	void set_solo(int c, bool on) { if (c >= 0 && c < MAX_DCP) _solo[c] = on; }
++	void set_mute(int c, bool on) { if (c >= 0 && c < MAX_DCP) _mute[c] = on; }
++	bool solo(int c) const { return c >= 0 && c < MAX_DCP && _solo[c]; }
++	bool mute(int c) const { return c >= 0 && c < MAX_DCP && _mute[c]; }
++	bool has_solo() const { for (int i = 0; i < MAX_DCP; ++i) if (_solo[i]) return true; return false; }
++	void clear() { for (int i = 0; i < MAX_DCP; ++i) { _solo[i] = false; _mute[i] = false; } }
++
++	/** 라우팅 매트릭스를 lock-free 로 발행(비활성 버퍼 기록 후 인덱스 플립). */
++	void publish(MatrixSrc const& src) {
++		int const w = 1 - _pub.load(std::memory_order_relaxed);
++		_matrix[w] = src;
++		_pub.store(w, std::memory_order_release);
++	}
++
++	/** 채널 피크(dBFS). 무신호는 -120 dB. */
++	float peak_dbfs(int c) const {
++		if (c < 0 || c >= MAX_DCP) return -120.0f;
++		float const p = _peak[c].load(std::memory_order_relaxed);
++		return p > 1e-6f ? 20.0f * std::log10(p) : -120.0f;
++	}
++
++private:
++	static void zero_matrix(MatrixSrc& m) {
++		for (int c = 0; c < MAX_DCP; ++c)
++			for (int j = 0; j < MAX_DEV; ++j) m.g[c][j] = 0.0f;
++	}
++
++	int _dcp_ch = 0, _dev_ch = 0;
++	unsigned int _block = 0;
++	std::vector<float> _mid;                  /* block*MAX_DCP 사전할당 */
++	std::atomic<float> _peak[MAX_DCP];
++	MatrixSrc _matrix[2];
++	std::atomic<int> _pub{0};                 /* 콜백이 읽는 활성 인덱스 */
++	bool _solo[MAX_DCP] = {};
++	bool _mute[MAX_DCP] = {};
++};
++
++#endif
+diff --git a/src/wx/channel_inspector_dialog.h b/src/wx/channel_inspector_dialog.h
+new file mode 100644
+index 0000000..4a5f388
+--- /dev/null
++++ b/src/wx/channel_inspector_dialog.h
+@@ -0,0 +1,137 @@
++/*
++    RoomTune — DCP 검수용 오디오 채널 인스펙터 다이얼로그 (비모달 UI)
++    DCP-o-matic 파생물 (GPL-2.0-or-later).
++
++    채널별 solo/mute 체크박스 + 실시간 피크 미터(dBFS). 자체 오디오 상태는
++    없고 모든 제어를 FilmViewer 포워더로 위임한다. 열릴 때 인스펙터를 활성화
++    (지연 identity Butler 재구성)하고 닫힐 때 비활성화한다.
++*/
++
++#ifndef DCPOMATIC_CHANNEL_INSPECTOR_DIALOG_H
++#define DCPOMATIC_CHANNEL_INSPECTOR_DIALOG_H
++
++#include "film_viewer.h"
++#include "wx_util.h"
++#include "lib/film.h"
++#include "lib/util.h"
++#include <dcp/warnings.h>
++LIBDCP_DISABLE_WARNINGS
++#include <wx/wx.h>
++LIBDCP_ENABLE_WARNINGS
++#include <algorithm>
++#include <list>
++#include <vector>
++
++class ChannelInspectorDialog : public wxDialog
++{
++public:
++	ChannelInspectorDialog(wxWindow* parent, FilmViewer& viewer)
++		: wxDialog(parent, wxID_ANY, _("Channel inspector"), wxDefaultPosition, wxDefaultSize,
++		           wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
++		, _viewer(viewer)
++		, _timer(this)
++	{
++		_sizer = new wxBoxSizer(wxVERTICAL);
++
++		auto intro = new wxStaticText(this, wxID_ANY,
++			_("Solo/mute individual DCP channels and watch per-channel peak levels to verify mapping."));
++		_sizer->Add(intro, 0, wxALL, DCPOMATIC_DIALOG_BORDER);
++
++		_grid = new wxFlexGridSizer(4, 4, 12);   /* 4열: Label / Solo / Mute / Peak */
++		_sizer->Add(_grid, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, DCPOMATIC_DIALOG_BORDER);
++
++		auto clear = new wxButton(this, wxID_ANY, _("Clear solo/mute"));
++		clear->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { clear_clicked(); });
++		_sizer->Add(clear, 0, wxLEFT | wxRIGHT | wxBOTTOM, DCPOMATIC_DIALOG_BORDER);
++
++		SetSizerAndFit(_sizer);
++
++		Bind(wxEVT_TIMER, [this](wxTimerEvent&) { on_timer(); });
++		Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent& ev) { Show(false); ev.Veto(); });
++	}
++
++	bool Show(bool show = true) override
++	{
++		if (show) {
++			_viewer.inspector_set_active(true);
++			rebuild_rows();
++			_timer.Start(100);
++		} else {
++			_timer.Stop();
++			_viewer.inspector_set_active(false);
++		}
++		return wxDialog::Show(show);
++	}
++
++private:
++	void rebuild_rows()
++	{
++		_grid->Clear(true);
++		_solo.clear();
++		_mute.clear();
++		_peak.clear();
++
++		std::list<int> mapped;
++		if (auto film = _viewer.film()) {
++			mapped = film->mapped_audio_channels();
++		}
++
++		int const n = _viewer.inspector_dcp_channels();
++		for (int c = 0; c < n; ++c) {
++			bool const is_mapped = std::find(mapped.begin(), mapped.end(), c) != mapped.end();
++			auto lab = wxString::Format(wxT("%d  "), c) + std_to_wx(short_audio_channel_name(c));
++			if (!is_mapped) {
++				lab += wxT("  (unmapped)");
++			}
++			auto label = new wxStaticText(this, wxID_ANY, lab);
++			if (!is_mapped) {
++				label->Enable(false);   /* 회색 처리 */
++			}
++			auto solo = new wxCheckBox(this, wxID_ANY, _("Solo"));
++			auto mute = new wxCheckBox(this, wxID_ANY, _("Mute"));
++			auto peak = new wxStaticText(this, wxID_ANY, wxT("-inf dB"));
++			solo->Bind(wxEVT_CHECKBOX, [this, c](wxCommandEvent&) { _viewer.inspector_set_solo(c, _solo[c]->GetValue()); });
++			mute->Bind(wxEVT_CHECKBOX, [this, c](wxCommandEvent&) { _viewer.inspector_set_mute(c, _mute[c]->GetValue()); });
++
++			_grid->Add(label, 0, wxALIGN_CENTER_VERTICAL);
++			_grid->Add(solo, 0);
++			_grid->Add(mute, 0);
++			_grid->Add(peak, 0, wxALIGN_CENTER_VERTICAL);
++			_solo.push_back(solo);
++			_mute.push_back(mute);
++			_peak.push_back(peak);
++		}
++
++		_sizer->Layout();
++		Fit();
++	}
++
++	void clear_clicked()
++	{
++		_viewer.inspector_clear();
++		for (auto b: _solo) {
++			b->SetValue(false);
++		}
++		for (auto b: _mute) {
++			b->SetValue(false);
++		}
++	}
++
++	void on_timer()
++	{
++		for (size_t c = 0; c < _peak.size(); ++c) {
++			float const db = _viewer.inspector_peak_dbfs(static_cast<int>(c));
++			_peak[c]->SetLabel(db <= -119.0f ? wxString(wxT("-inf dB")) : wxString::Format(wxT("%.1f dB"), db));
++		}
++	}
++
++	FilmViewer& _viewer;
++	wxTimer _timer;
++	wxBoxSizer* _sizer = nullptr;
++	wxFlexGridSizer* _grid = nullptr;
++	std::vector<wxCheckBox*> _solo;
++	std::vector<wxCheckBox*> _mute;
++	std::vector<wxStaticText*> _peak;
++};
++
++#endif
+diff --git a/src/wx/film_viewer.cc b/src/wx/film_viewer.cc
+index dcee453..34079d9 100644
+--- a/src/wx/film_viewer.cc
++++ b/src/wx/film_viewer.cc
+@@ -34,6 +34,7 @@
+ #include "simple_video_view.h"
+ #include "wx_util.h"
+ #include "lib/butler.h"
++#include "lib/constants.h"
+ #include "lib/config.h"
+ #include "lib/dcp_content.h"
+ #include "lib/dcpomatic_log.h"
+@@ -243,11 +244,33 @@ FilmViewer::create_butler()
+ 
+ 	auto& audio = AudioBackend::instance()->rtaudio();
+ 
++	/* RoomTune 지연 identity화: 채널 인스펙터가 활성일 때만 Butler 를 identity 매핑 +
++	   DCP 채널수로 구성한다(콜백이 다운믹스 담당). 비활성이면 종전 경로 그대로라
++	   기존 재생 품질에 아무 변화가 없다. */
++	AudioMapping map;
++	int butler_channels;
++	_inspect_dcp_channels = 0;
++	if (_inspector_active && _film->audio_channels() > 0 && _audio_channels > 0) {
++		int const N = std::min(_film->audio_channels(), MAX_DCP_AUDIO_CHANNELS);
++		_inspect_dcp_channels = N;
++		AudioMapping ident(MAX_DCP_AUDIO_CHANNELS, N);
++		ident.make_zero();
++		for (int i = 0; i < N; ++i) {
++			ident.set(i, i, 1.0f);
++		}
++		map = ident;
++		butler_channels = N;
++		_inspector.configure(N, _audio_channels, _audio_block_size);
++	} else {
++		map = Config::instance()->audio_mapping(_audio_channels);
++		butler_channels = _audio_channels;
++	}
++
+ 	_butler = std::make_shared<Butler>(
+ 		_film,
+ 		*_player,
+-		Config::instance()->audio_mapping(_audio_channels),
+-		_audio_channels,
++		map,
++		butler_channels,
+ 		AV_PIX_FMT_RGB24,
+ 		VideoRange::FULL,
+ 		(opengl && _optimisation != Optimisation::NONE) ? Image::Alignment::COMPACT : Image::Alignment::PADDED,
+@@ -258,10 +281,77 @@ FilmViewer::create_butler()
+ 
+ 	_closed_captions_dialog->set_butler(_butler);
+ 
++	if (_inspect_dcp_channels > 0) {
++		inspector_recompute_matrix();
++	}
++
+ 	resume();
+ }
+ 
+ 
++void
++FilmViewer::inspector_set_active(bool a)
++{
++	if (_inspector_active == a) {
++		return;
++	}
++	_inspector_active = a;
++	if (!a) {
++		/* 끌 때 solo/mute 해제 → 다음에 켜면 normal 부터. */
++		_inspector.clear();
++	}
++	/* Butler 를 새 모드로 재구성 (identity ↔ normal). */
++	destroy_and_maybe_create_butler();
++}
++
++
++void
++FilmViewer::inspector_recompute_matrix()
++{
++	int const dcp = _inspect_dcp_channels;
++	int const dev = _audio_channels;
++	if (dcp <= 0 || dev <= 0) {
++		return;
++	}
++
++	ChannelInspector::MatrixSrc src;
++	for (int c = 0; c < ChannelInspector::MAX_DCP; ++c) {
++		for (int j = 0; j < ChannelInspector::MAX_DEV; ++j) {
++			src.g[c][j] = 0.0f;
++		}
++	}
++
++	if (_inspector.has_solo()) {
++		/* solo 된 채널만 모니터 L/R 로 모노합(×0.707). mute 와 겹치면 무음. */
++		for (int s = 0; s < dcp; ++s) {
++			if (!_inspector.solo(s) || _inspector.mute(s)) {
++				continue;
++			}
++			src.g[s][0] += 0.70710678f;
++			if (dev > 1) {
++				src.g[s][1] += 0.70710678f;
++			}
++		}
++	} else {
++		/* solo 없음 → 현행 출력 매핑 그대로(스테레오 다운믹스 계수 포함),
++		   mute 채널만 제거 → 인스펙터가 켜져 있어도 출력이 종전과 동일. */
++		auto const map = Config::instance()->audio_mapping(dev);
++		int const min_in = std::min(dcp, map.input_channels());
++		int const min_out = std::min(dev, map.output_channels());
++		for (int s = 0; s < min_in; ++s) {
++			if (_inspector.mute(s)) {
++				continue;
++			}
++			for (int j = 0; j < min_out; ++j) {
++				src.g[s][j] = map.get(s, j);
++			}
++		}
++	}
++
++	_inspector.publish(src);
++}
++
++
+ void
+ FilmViewer::set_outline_content(bool o)
+ {
+@@ -738,13 +828,32 @@ FilmViewer::audio_callback(void* out_p, unsigned int frames)
+ 		_stream_time = audio.getStreamTime();
+ 	}
+ 
+-	while (true) {
+-		auto t = _butler->get_audio(Butler::Behaviour::NON_BLOCKING, reinterpret_cast<float*>(out_p), frames);
+-		if (!t || DCPTime(uncorrected_time() - *t) < one_video_frame()) {
+-			/* There was an underrun or this audio is on time; carry on */
+-			break;
++	if (_inspector_active && _inspector.active_pipeline()) {
++		/* RoomTune 채널 인스펙터: Butler 가 DCP 레이아웃(N ch)으로 mid 를 채우면,
++		   콜백이 채널별 피크를 재고 무할당 다운믹스로 out_p(device ch)에 라우팅한다.
++		   (룸 EQ 는 이때 바이패스 — out_p 가 다운믹스 후 device 레이아웃이므로.) */
++		float* mid = _inspector.mid_buffer(frames);
++		while (true) {
++			auto t = _butler->get_audio(Butler::Behaviour::NON_BLOCKING, mid, frames);
++			if (!t || DCPTime(uncorrected_time() - *t) < one_video_frame()) {
++				break;
++			}
+ 		}
+-		/* The audio we just got was (very) late; drop it and get some more. */
++		_inspector.meter(mid, frames);
++		_inspector.downmix(mid, reinterpret_cast<float*>(out_p), frames);
++	} else {
++		while (true) {
++			auto t = _butler->get_audio(Butler::Behaviour::NON_BLOCKING, reinterpret_cast<float*>(out_p), frames);
++			if (!t || DCPTime(uncorrected_time() - *t) < one_video_frame()) {
++				/* There was an underrun or this audio is on time; carry on */
++				break;
++			}
++			/* The audio we just got was (very) late; drop it and get some more. */
++		}
++
++		/* RoomTune: 재생 경로 룸 EQ (재생 전용 — 내보내는 DCP에는 영향 없음).
++		   out_p 는 인터리브 float32, _audio_channels 채널, DCP 채널 순서. */
++		_room_eq.process(reinterpret_cast<float*>(out_p), frames, static_cast<unsigned int>(_audio_channels));
+ 	}
+ 
+ 	if (auto lm = boost::mutex::scoped_lock(_latency_history_mutex, boost::try_to_lock)) {
+diff --git a/src/wx/film_viewer.h b/src/wx/film_viewer.h
+index 6d08df3..a241824 100644
+--- a/src/wx/film_viewer.h
++++ b/src/wx/film_viewer.h
+@@ -24,8 +24,14 @@
+  */
+ 
+ 
++#ifndef DCPOMATIC_FILM_VIEWER_H
++#define DCPOMATIC_FILM_VIEWER_H
++
++
+ #include "optimisation.h"
+ #include "video_view.h"
++#include "room_eq.h"
++#include "channel_inspector.h"
+ #include "lib/change_signaller.h"
+ #include "lib/config.h"
+ #include "lib/film_property.h"
+@@ -126,6 +132,24 @@ public:
+ 
+ 	int audio_callback(void* out, unsigned int frames);
+ 
++	/* RoomTune: 재생 경로 룸 EQ 토글 (내보내는 DCP에는 영향 없음) */
++	void set_room_eq_enabled(bool e) { _room_eq.set_enabled(e); }
++	bool room_eq_enabled() const { return _room_eq.enabled(); }
++
++	/* RoomTune: DCP 검수용 채널 인스펙터 포워더 (모두 GUI 스레드).
++	   지연 identity화 — inspector_set_active(true) 최초 호출 시에만 Butler 를
++	   identity 매핑으로 재구성하고, 그 전까지 기존 재생 경로는 무변경. */
++	void inspector_set_active(bool a);              /* .cc: active 전환 + Butler 재생성 */
++	bool inspector_active() const { return _inspector_active; }
++	int  inspector_dcp_channels() const { return _inspect_dcp_channels; }
++	void inspector_set_solo(int c, bool on) { _inspector.set_solo(c, on); inspector_recompute_matrix(); }
++	void inspector_set_mute(int c, bool on) { _inspector.set_mute(c, on); inspector_recompute_matrix(); }
++	void inspector_clear() { _inspector.clear(); inspector_recompute_matrix(); }
++	bool inspector_solo(int c) const { return _inspector.solo(c); }
++	bool inspector_mute(int c) const { return _inspector.mute(c); }
++	bool inspector_has_solo() const { return _inspector.has_solo(); }
++	float inspector_peak_dbfs(int c) const { return _inspector.peak_dbfs(c); }
++
+ 	StateTimer const & state_timer() const {
+ 		return _video_view->state_timer();
+ 	}
+@@ -183,6 +207,7 @@ private:
+ 	void destroy_butler();
+ 	void create_butler();
+ 	void destroy_and_maybe_create_butler();
++	void inspector_recompute_matrix();   /* solo/mute → 라우팅 매트릭스 재계산·발행 (GUI 스레드) */
+ 	void config_changed(Config::Property);
+ 	void film_length_change();
+ 	void ui_finished();
+@@ -200,6 +225,12 @@ private:
+ 	std::vector<int> _pending_player_changes;
+ 
+ 	int _audio_channels = 0;
++	RoomEQ _room_eq;
++	/* RoomTune 채널 인스펙터(검수). _inspector_active 가 true 일 때만 Butler 가
++	   identity 매핑으로 구성되고 콜백이 다운믹스를 담당한다(지연 identity화). */
++	ChannelInspector _inspector;
++	bool _inspector_active = false;
++	int _inspect_dcp_channels = 0;
+ 	unsigned int _audio_block_size = 1024;
+ 	bool _playing = false;
+ 	int _suspended = 0;
+@@ -242,3 +273,5 @@ private:
+ 
+ 	boost::signals2::scoped_connection _config_changed_connection;
+ };
++
++#endif
+diff --git a/src/wx/room_eq.h b/src/wx/room_eq.h
+new file mode 100644
+index 0000000..fe3042c
+--- /dev/null
++++ b/src/wx/room_eq.h
+@@ -0,0 +1,266 @@
++/*
++    RoomTune — DCP-o-matic 재생 경로 룸튜닝 EQ (소프트웨어 B-chain)
++    DCP-o-matic 파생물 (GPL-2.0-or-later).
++
++    재생(playback) 전용 채널별 biquad EQ.
++    이 처리는 FilmViewer 오디오 콜백에서만 적용되며, 내보내는 DCP에는 영향이 없다.
++
++    필터는 "측정 결과"에서 온다:
++      REW(Room EQ Wizard) 등으로 스피커+룸을 실측하여 타깃 커브(극장 X-curve 등)에
++      맞춘 보정 필터를 뽑고, REW "Filter Settings as text"(= EQ APO) 포맷으로 저장한 뒤
++      아래 경로 중 하나에 두면 플레이어가 재생 시 그 필터를 적용한다:
++        1) 환경변수 ROOMTUNE_EQ_FILE 가 가리키는 파일
++        2) ~/.config/roomtune/room_eq.conf
++      파일이 없거나 유효 밴드가 0개면 EQ 는 무처리(no-op) — 실측 없이는 보정하지 않는다.
++
++    엔진 불변 규칙: 부스트 상한 +6 dB(초과 시 클램프), 컷은 제한 없음,
++    접근성 채널(HI=6, VI=7)은 보정 제외.
++*/
++
++#ifndef DCPOMATIC_ROOM_EQ_H
++#define DCPOMATIC_ROOM_EQ_H
++
++#include "biquad.h"
++#include <atomic>
++#include <cmath>
++#include <vector>
++#include <algorithm>
++#include <cstddef>
++#include <cstdlib>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <sstream>
++#include <fstream>
++
++/** 채널별 RBJ biquad 캐스케이드 EQ.
++ *  process()는 RtAudio 콜백(오디오) 스레드에서 호출되므로 할당/파일 I/O 를 하지 않는다.
++ *  계수·프리앰프는 생성 시 파일에서 1회 로드, on/off 만 atomic 으로 토글한다.
++ */
++class RoomEQ
++{
++public:
++	/** 생성 시 측정 필터 파일을 자동 로드(있으면). 오디오 스트림 fs 는 DCP 표준 48 kHz 가정. */
++	RoomEQ()
++	{
++		load_default();
++	}
++
++	void set_enabled(bool e) { _enabled.store(e, std::memory_order_relaxed); }
++	bool enabled() const { return _enabled.load(std::memory_order_relaxed); }
++
++	/** 실측 필터가 하나라도 로드됐는지 */
++	bool loaded() const { return !_bands.empty(); }
++	std::size_t band_count() const { return _bands.size(); }
++	std::string const& source_path() const { return _source; }
++
++	/** 인터리브 float32, frames x channels, DCP 채널 순서(0=L,1=R,2=C,3=LFE,4=Ls,5=Rs,...). */
++	void process(float* io, unsigned int frames, unsigned int channels)
++	{
++		if (!_enabled.load(std::memory_order_relaxed) || channels == 0 || _bands.empty()) {
++			return;
++		}
++		unsigned int const cn = std::min<unsigned int>(channels, MAX_CH);
++		unsigned int const bn = std::min<unsigned int>(static_cast<unsigned int>(_bands.size()), MAX_BANDS);
++		double const pre = _preamp;
++		for (unsigned int f = 0; f < frames; ++f) {
++			float* fr = io + static_cast<std::size_t>(f) * channels;
++			for (unsigned int c = 0; c < cn; ++c) {
++				/* HI(6)/VI(7) 접근성 채널은 룸 보정 대상에서 제외 */
++				if (c == 6 || c == 7) {
++					continue;
++				}
++				double x = fr[c] * pre;
++				for (unsigned int b = 0; b < bn; ++b) {
++					x = _bands[b].process(_state[c][b], x);
++				}
++				fr[c] = static_cast<float>(x);
++			}
++		}
++	}
++
++	/** REW/EQ-APO 파라메트릭 텍스트 파일에서 필터를 로드. 성공 시 true. */
++	bool load_file(std::string const& path)
++	{
++		std::ifstream in(path);
++		if (!in) {
++			return false;
++		}
++		double const fs = SAMPLE_RATE;
++		std::vector<Biquad> bands;
++		double preamp_db = 0.0;
++		std::string line;
++		unsigned int clamped = 0;
++		while (std::getline(in, line)) {
++			std::string const l = trim(line);
++			if (l.empty() || l[0] == '#' || l[0] == '*') {
++				continue;
++			}
++			/* Preamp: -6.0 dB */
++			if (istarts_with(l, "Preamp")) {
++				double v;
++				if (find_after(l, "Preamp", v) || find_number(l, v)) {
++					preamp_db = v;
++				}
++				continue;
++			}
++			/* Filter N: ON PK Fc 63.0 Hz Gain -5.0 dB Q 4.000 */
++			if (!istarts_with(l, "Filter")) {
++				continue;
++			}
++			std::vector<std::string> tok = split_ws(l);
++			/* "ON" 이 없으면(=OFF/None) 건너뜀 */
++			int on_idx = index_of_ci(tok, "ON");
++			if (on_idx < 0 || on_idx + 1 >= static_cast<int>(tok.size())) {
++				continue;
++			}
++			std::string type = upper(tok[on_idx + 1]);
++			if (type == "NONE") {
++				continue;
++			}
++			double fc = 0, gain = 0, q = 0;
++			bool has_fc = find_after(l, "Fc", fc);
++			bool has_gain = find_after(l, "Gain", gain);
++			bool has_q = find_after(l, "Q", q);
++			if (!has_fc || fc <= 0 || fc >= fs / 2) {
++				continue;  /* 나이퀴스트 밖이거나 Fc 없음 → 스킵 */
++			}
++			/* 엔진 규칙: 부스트 상한 +6 dB */
++			if (has_gain && gain > MAX_BOOST_DB) {
++				gain = MAX_BOOST_DB;
++				++clamped;
++			}
++			Biquad bq;
++			bool ok = true;
++			if (type == "PK" || type == "PEQ" || type == "MODAL") {
++				if (!has_q || q <= 0) q = 1.0;
++				bq = roomtune::peaking(fc, q, gain, fs);
++			} else if (type == "LS" || type == "LSC" || type == "LOWSHELF") {
++				if (!has_q || q <= 0) q = 0.707;
++				bq = roomtune::shelf(fc, q, gain, fs, /*low=*/true);
++			} else if (type == "HS" || type == "HSC" || type == "HIGHSHELF") {
++				if (!has_q || q <= 0) q = 0.707;
++				bq = roomtune::shelf(fc, q, gain, fs, /*low=*/false);
++			} else if (type == "LP" || type == "LPQ" || type == "LOWPASS") {
++				if (!has_q || q <= 0) q = 0.707;
++				bq = roomtune::pass(fc, q, fs, /*low=*/true);
++			} else if (type == "HP" || type == "HPQ" || type == "HIGHPASS") {
++				if (!has_q || q <= 0) q = 0.707;
++				bq = roomtune::pass(fc, q, fs, /*low=*/false);
++			} else {
++				ok = false;  /* 미지원 타입(AP, BP 등) */
++			}
++			if (ok && bands.size() < MAX_BANDS) {
++				bands.push_back(bq);
++			}
++		}
++		if (bands.empty() && preamp_db == 0.0) {
++			return false;  /* 파일은 있으나 쓸 밴드 없음 */
++		}
++		/* 프리앰프는 부스트 방지 목적이라 통상 음수. 안전상 +0 dB 로 상한(감쇠만 허용) */
++		double const pdb = std::min(preamp_db, 0.0);
++		_bands = std::move(bands);
++		_preamp = std::pow(10.0, pdb / 20.0);
++		_source = path;
++		std::fprintf(stderr, "[RoomEQ] loaded %zu band(s), preamp %.1f dB from %s%s\n",
++		             _bands.size(), pdb, path.c_str(),
++		             clamped ? " (일부 게인 +6dB 로 클램프됨)" : "");
++		return true;
++	}
++
++private:
++	static unsigned int const MAX_CH = 16;
++	static std::size_t const MAX_BANDS = 32;
++	static constexpr double SAMPLE_RATE = 48000.0;  /* DCP 오디오 표준 */
++	static constexpr double MAX_BOOST_DB = 6.0;     /* 엔진 규칙: 부스트 상한 */
++
++	/* DSP 코어(Biquad/State/peaking/shelf/pass)는 biquad.h 공유(roomtune::).
++	   channel_inspector.h 와 동일 코어를 쓴다. 아래 alias 로 기존 코드 무변경. */
++	using Biquad = roomtune::Biquad;
++	using State = roomtune::BiquadState;
++
++	void load_default()
++	{
++		if (char const* env = std::getenv("ROOMTUNE_EQ_FILE")) {
++			if (env[0] && load_file(env)) {
++				return;
++			}
++		}
++		if (char const* home = std::getenv("HOME")) {
++			if (load_file(std::string(home) + "/.config/roomtune/room_eq.conf")) {
++				return;
++			}
++		}
++		/* 실측 파일 없음 → 무처리로 남는다(가짜 데모 없음) */
++	}
++
++	/* ---- 파싱 헬퍼(모두 생성 스레드 전용) ---- */
++	static std::string trim(std::string s) {
++		std::size_t a = s.find_first_not_of(" \t\r\n");
++		std::size_t b = s.find_last_not_of(" \t\r\n");
++		return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
++	}
++	static std::string upper(std::string s) {
++		for (auto& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
++		return s;
++	}
++	static bool istarts_with(std::string const& s, char const* p) {
++		std::size_t n = std::strlen(p);
++		if (s.size() < n) return false;
++		for (std::size_t i = 0; i < n; ++i) {
++			if (std::toupper(static_cast<unsigned char>(s[i])) != std::toupper(static_cast<unsigned char>(p[i]))) return false;
++		}
++		return true;
++	}
++	static std::vector<std::string> split_ws(std::string const& s) {
++		std::vector<std::string> out;
++		std::istringstream is(s);
++		std::string t;
++		while (is >> t) out.push_back(t);
++		return out;
++	}
++	static int index_of_ci(std::vector<std::string> const& v, char const* w) {
++		for (int i = 0; i < static_cast<int>(v.size()); ++i) {
++			if (upper(v[i]) == upper(std::string(w))) return i;
++		}
++		return -1;
++	}
++	static bool parse_double(std::string const& s, double& out) {
++		char* end = nullptr;
++		double v = std::strtod(s.c_str(), &end);
++		if (end == s.c_str()) return false;
++		out = v;
++		return true;
++	}
++	/* 키워드(예: "Fc") 바로 뒤에 오는 첫 숫자 토큰을 읽는다. */
++	static bool find_after(std::string const& line, char const* key, double& out) {
++		std::vector<std::string> tok = split_ws(line);
++		std::string const K = upper(std::string(key));
++		for (std::size_t i = 0; i + 1 < tok.size(); ++i) {
++			/* "Fc" 또는 "Fc:" 등 접두 일치 */
++			std::string t = upper(tok[i]);
++			if (t == K || t == K + ":") {
++				for (std::size_t j = i + 1; j < tok.size(); ++j) {
++					double v;
++					if (parse_double(tok[j], v)) { out = v; return true; }
++				}
++			}
++		}
++		return false;
++	}
++	/* 라인 안 첫 숫자 */
++	static bool find_number(std::string const& line, double& out) {
++		for (auto const& t : split_ws(line)) {
++			if (parse_double(t, out)) return true;
++		}
++		return false;
++	}
++
++	std::vector<Biquad> _bands;
++	double _preamp = 1.0;
++	std::string _source;
++	State _state[MAX_CH][MAX_BANDS];
++	std::atomic<bool> _enabled{false};
++};
++
++#endif

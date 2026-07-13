@@ -1,5 +1,5 @@
 diff --git a/src/tools/dcpomatic_player.cc b/src/tools/dcpomatic_player.cc
-index 688decc..2e0f30e 100644
+index 688decc..2269b27 100644
 --- a/src/tools/dcpomatic_player.cc
 +++ b/src/tools/dcpomatic_player.cc
 @@ -32,6 +32,7 @@
@@ -81,7 +81,7 @@ index 688decc..2e0f30e 100644
 +			_channel_inspector_dialog.reset(this, _viewer);
 +		}
 +
-+		_channel_inspector_dialog->Show();
++		_channel_inspector_dialog->open();
 +	}
 +
  	void help_about()
@@ -334,10 +334,10 @@ index 0000000..9a33ecb
 +#endif
 diff --git a/src/wx/channel_inspector_dialog.h b/src/wx/channel_inspector_dialog.h
 new file mode 100644
-index 0000000..4a5f388
+index 0000000..54cd63b
 --- /dev/null
 +++ b/src/wx/channel_inspector_dialog.h
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,144 @@
 +/*
 +    RoomTune — DCP 검수용 오디오 채널 인스펙터 다이얼로그 (비모달 UI)
 +    DCP-o-matic 파생물 (GPL-2.0-or-later).
@@ -362,12 +362,15 @@ index 0000000..4a5f388
 +#include <list>
 +#include <vector>
 +
-+class ChannelInspectorDialog : public wxDialog
++/* wxDialog 가 아니라 wxFrame 을 쓴다: macOS wxDialog 는 자식 컨트롤(체크박스)의
++   command 이벤트를 취소(close)로 오인해 다이얼로그를 간헐적으로 닫아버린다.
++   wxFrame 은 이 특수 동작이 없어 solo/mute 클릭이 창을 닫지 않는다. */
++class ChannelInspectorDialog : public wxFrame
 +{
 +public:
 +	ChannelInspectorDialog(wxWindow* parent, FilmViewer& viewer)
-+		: wxDialog(parent, wxID_ANY, _("Channel inspector"), wxDefaultPosition, wxDefaultSize,
-+		           wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
++		: wxFrame(parent, wxID_ANY, _("Channel inspector"), wxDefaultPosition, wxDefaultSize,
++		          wxDEFAULT_FRAME_STYLE | wxFRAME_FLOAT_ON_PARENT)
 +		, _viewer(viewer)
 +		, _timer(this)
 +	{
@@ -387,20 +390,24 @@ index 0000000..4a5f388
 +		SetSizerAndFit(_sizer);
 +
 +		Bind(wxEVT_TIMER, [this](wxTimerEvent&) { on_timer(); });
-+		Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent& ev) { Show(false); ev.Veto(); });
-+	}
-+
-+	bool Show(bool show = true) override
-+	{
-+		if (show) {
-+			_viewer.inspector_set_active(true);
-+			rebuild_rows();
-+			_timer.Start(100);
-+		} else {
++		Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent& ev) {
 +			_timer.Stop();
 +			_viewer.inspector_set_active(false);
-+		}
-+		return wxDialog::Show(show);
++			Hide();
++			ev.Veto();   /* wx_ptr 이 재사용하므로 파괴하지 않고 숨김 */
++		});
++	}
++
++	/** 다이얼로그를 연다(메뉴에서 호출). Show() 를 override 하면 wxWidgets 의 내부
++	    Show/Hide 호출(레이아웃·포커스)마다 인스펙터가 토글되어 자멸하므로, override
++	    대신 명시적 진입점을 둔다. */
++	void open()
++	{
++		_viewer.inspector_set_active(true);
++		rebuild_rows();
++		_timer.Start(100);
++		wxFrame::Show(true);
++		Raise();
 +	}
 +
 +private:
@@ -430,8 +437,8 @@ index 0000000..4a5f388
 +			auto solo = new wxCheckBox(this, wxID_ANY, _("Solo"));
 +			auto mute = new wxCheckBox(this, wxID_ANY, _("Mute"));
 +			auto peak = new wxStaticText(this, wxID_ANY, wxT("-inf dB"));
-+			solo->Bind(wxEVT_CHECKBOX, [this, c](wxCommandEvent&) { _viewer.inspector_set_solo(c, _solo[c]->GetValue()); });
-+			mute->Bind(wxEVT_CHECKBOX, [this, c](wxCommandEvent&) { _viewer.inspector_set_mute(c, _mute[c]->GetValue()); });
++			solo->Bind(wxEVT_CHECKBOX, [this, c](wxCommandEvent& ev) { _viewer.inspector_set_solo(c, ev.IsChecked()); });
++			mute->Bind(wxEVT_CHECKBOX, [this, c](wxCommandEvent& ev) { _viewer.inspector_set_mute(c, ev.IsChecked()); });
 +
 +			_grid->Add(label, 0, wxALIGN_CENTER_VERTICAL);
 +			_grid->Add(solo, 0);
@@ -476,7 +483,7 @@ index 0000000..4a5f388
 +
 +#endif
 diff --git a/src/wx/film_viewer.cc b/src/wx/film_viewer.cc
-index dcee453..34079d9 100644
+index dcee453..dd7a4c5 100644
 --- a/src/wx/film_viewer.cc
 +++ b/src/wx/film_viewer.cc
 @@ -34,6 +34,7 @@
@@ -523,7 +530,7 @@ index dcee453..34079d9 100644
  		AV_PIX_FMT_RGB24,
  		VideoRange::FULL,
  		(opengl && _optimisation != Optimisation::NONE) ? Image::Alignment::COMPACT : Image::Alignment::PADDED,
-@@ -258,10 +281,77 @@ FilmViewer::create_butler()
+@@ -258,10 +281,70 @@ FilmViewer::create_butler()
  
  	_closed_captions_dialog->set_butler(_butler);
  
@@ -567,30 +574,23 @@ index dcee453..34079d9 100644
 +		}
 +	}
 +
-+	if (_inspector.has_solo()) {
-+		/* solo 된 채널만 모니터 L/R 로 모노합(×0.707). mute 와 겹치면 무음. */
-+		for (int s = 0; s < dcp; ++s) {
-+			if (!_inspector.solo(s) || _inspector.mute(s)) {
-+				continue;
-+			}
-+			src.g[s][0] += 0.70710678f;
-+			if (dev > 1) {
-+				src.g[s][1] += 0.70710678f;
-+			}
++	/* solo-in-place: 채널을 원래 출력 라우팅(Config 매핑) 그대로 두되, solo 중이면
++	   solo 안 된 채널을, 그리고 언제나 mute 채널을 죽인다.
++	   → L solo = 왼쪽만(볼륨 유지), C solo = (원래대로) 양쪽. 모노합으로 2채널
++	   강제 스플릿하지 않으므로 격리 채널이 제자리에서 원래 음량으로 들린다. */
++	auto const map = Config::instance()->audio_mapping(dev);
++	int const min_in = std::min(dcp, map.input_channels());
++	int const min_out = std::min(dev, map.output_channels());
++	bool const soloing = _inspector.has_solo();
++	for (int s = 0; s < min_in; ++s) {
++		if (soloing && !_inspector.solo(s)) {
++			continue;   /* solo 중인데 이 채널은 solo 안 됨 → 죽임 */
 +		}
-+	} else {
-+		/* solo 없음 → 현행 출력 매핑 그대로(스테레오 다운믹스 계수 포함),
-+		   mute 채널만 제거 → 인스펙터가 켜져 있어도 출력이 종전과 동일. */
-+		auto const map = Config::instance()->audio_mapping(dev);
-+		int const min_in = std::min(dcp, map.input_channels());
-+		int const min_out = std::min(dev, map.output_channels());
-+		for (int s = 0; s < min_in; ++s) {
-+			if (_inspector.mute(s)) {
-+				continue;
-+			}
-+			for (int j = 0; j < min_out; ++j) {
-+				src.g[s][j] = map.get(s, j);
-+			}
++		if (_inspector.mute(s)) {
++			continue;   /* mute 채널은 항상 죽임 */
++		}
++		for (int j = 0; j < min_out; ++j) {
++			src.g[s][j] = map.get(s, j);
 +		}
 +	}
 +
@@ -601,7 +601,7 @@ index dcee453..34079d9 100644
  void
  FilmViewer::set_outline_content(bool o)
  {
-@@ -738,13 +828,32 @@ FilmViewer::audio_callback(void* out_p, unsigned int frames)
+@@ -738,13 +821,32 @@ FilmViewer::audio_callback(void* out_p, unsigned int frames)
  		_stream_time = audio.getStreamTime();
  	}
  

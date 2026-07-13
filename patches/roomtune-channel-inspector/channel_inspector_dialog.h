@@ -22,12 +22,15 @@ LIBDCP_ENABLE_WARNINGS
 #include <list>
 #include <vector>
 
-class ChannelInspectorDialog : public wxDialog
+/* wxDialog 가 아니라 wxFrame 을 쓴다: macOS wxDialog 는 자식 컨트롤(체크박스)의
+   command 이벤트를 취소(close)로 오인해 다이얼로그를 간헐적으로 닫아버린다.
+   wxFrame 은 이 특수 동작이 없어 solo/mute 클릭이 창을 닫지 않는다. */
+class ChannelInspectorDialog : public wxFrame
 {
 public:
 	ChannelInspectorDialog(wxWindow* parent, FilmViewer& viewer)
-		: wxDialog(parent, wxID_ANY, _("Channel inspector"), wxDefaultPosition, wxDefaultSize,
-		           wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER)
+		: wxFrame(parent, wxID_ANY, _("Channel inspector"), wxDefaultPosition, wxDefaultSize,
+		          wxDEFAULT_FRAME_STYLE | wxFRAME_FLOAT_ON_PARENT)
 		, _viewer(viewer)
 		, _timer(this)
 	{
@@ -47,20 +50,24 @@ public:
 		SetSizerAndFit(_sizer);
 
 		Bind(wxEVT_TIMER, [this](wxTimerEvent&) { on_timer(); });
-		Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent& ev) { Show(false); ev.Veto(); });
-	}
-
-	bool Show(bool show = true) override
-	{
-		if (show) {
-			_viewer.inspector_set_active(true);
-			rebuild_rows();
-			_timer.Start(100);
-		} else {
+		Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent& ev) {
 			_timer.Stop();
 			_viewer.inspector_set_active(false);
-		}
-		return wxDialog::Show(show);
+			Hide();
+			ev.Veto();   /* wx_ptr 이 재사용하므로 파괴하지 않고 숨김 */
+		});
+	}
+
+	/** 다이얼로그를 연다(메뉴에서 호출). Show() 를 override 하면 wxWidgets 의 내부
+	    Show/Hide 호출(레이아웃·포커스)마다 인스펙터가 토글되어 자멸하므로, override
+	    대신 명시적 진입점을 둔다. */
+	void open()
+	{
+		_viewer.inspector_set_active(true);
+		rebuild_rows();
+		_timer.Start(100);
+		wxFrame::Show(true);
+		Raise();
 	}
 
 private:
@@ -90,8 +97,8 @@ private:
 			auto solo = new wxCheckBox(this, wxID_ANY, _("Solo"));
 			auto mute = new wxCheckBox(this, wxID_ANY, _("Mute"));
 			auto peak = new wxStaticText(this, wxID_ANY, wxT("-inf dB"));
-			solo->Bind(wxEVT_CHECKBOX, [this, c](wxCommandEvent&) { _viewer.inspector_set_solo(c, _solo[c]->GetValue()); });
-			mute->Bind(wxEVT_CHECKBOX, [this, c](wxCommandEvent&) { _viewer.inspector_set_mute(c, _mute[c]->GetValue()); });
+			solo->Bind(wxEVT_CHECKBOX, [this, c](wxCommandEvent& ev) { _viewer.inspector_set_solo(c, ev.IsChecked()); });
+			mute->Bind(wxEVT_CHECKBOX, [this, c](wxCommandEvent& ev) { _viewer.inspector_set_mute(c, ev.IsChecked()); });
 
 			_grid->Add(label, 0, wxALIGN_CENTER_VERTICAL);
 			_grid->Add(solo, 0);

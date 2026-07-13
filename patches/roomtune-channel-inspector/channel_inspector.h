@@ -19,6 +19,7 @@
 #ifndef DCPOMATIC_CHANNEL_INSPECTOR_H
 #define DCPOMATIC_CHANNEL_INSPECTOR_H
 
+#include "biquad.h"
 #include <atomic>
 #include <vector>
 #include <cstddef>
@@ -30,6 +31,12 @@ class ChannelInspector
 public:
 	static int const MAX_DCP = 16;   /* DCP 오디오 채널 상한(MAX_DCP_AUDIO_CHANNELS) */
 	static int const MAX_DEV = 16;   /* 출력 장치 채널 상한 */
+	static int const MAX_EQ_BANDS = 6;   /* 프리셋 최대 3 + 전역 X-curve 2 + 여유 */
+
+	/** 진단 프리셋 — 자동 solo 채널 + EQ 밴드 캐스케이드. */
+	enum class Preset { None, DialogueCheck, LfeOnly, SurroundAmbience, HfIntegrity };
+	/** 전역 모니터 EQ (프리셋과 독립 적용). */
+	enum class GlobalEq { Off, Flat, XCurve };
 
 	ChannelInspector() {
 		for (int i = 0; i < MAX_DCP; ++i) _peak[i].store(0.0f, std::memory_order_relaxed);
@@ -116,10 +123,97 @@ public:
 		return p > 1e-6f ? 20.0f * std::log10(p) : -120.0f;
 	}
 
+	/* ───────── 진단 EQ (Phase 5) ───────── */
+
+	/** 콜백: 다운믹스된 device 채널에 프리셋+전역 EQ 캐스케이드 (무할당·noexcept). */
+	void eq_process(float* out, unsigned int frames) noexcept {
+		int const idx = _eq_pub.load(std::memory_order_acquire);
+		int const n = _eq_n[idx];
+		if (n != _eq_active_n) {
+			/* 밴드 수 변경 → 필터 상태 리셋(콜백 스레드에서만 → 경합 없음, 클릭음 회피). */
+			for (int j = 0; j < MAX_DEV; ++j) {
+				for (int b = 0; b < MAX_EQ_BANDS; ++b) _eq_state[j][b] = roomtune::BiquadState{};
+			}
+			_eq_active_n = n;
+		}
+		if (n == 0) {
+			return;
+		}
+		int const dev = _dev_ch;
+		for (unsigned int f = 0; f < frames; ++f) {
+			float* o = out + static_cast<std::size_t>(f) * dev;
+			for (int j = 0; j < dev; ++j) {
+				double x = o[j];
+				for (int b = 0; b < n; ++b) {
+					x = _eq_bands[idx][b].process(_eq_state[j][b], x);
+				}
+				o[j] = static_cast<float>(x);
+			}
+		}
+	}
+
+	/** GUI: 진단 프리셋 적용 — 기존 solo/mute 초기화 후 프리셋 solo 설정 + EQ 재구성.
+	    (호출자는 이어서 라우팅 매트릭스를 재계산해야 한다.) */
+	void apply_preset(Preset p) {
+		clear();
+		_preset = p;
+		switch (p) {
+			case Preset::DialogueCheck:    set_solo(2, true); break;                    /* C */
+			case Preset::LfeOnly:          set_solo(3, true); break;                    /* LFE */
+			case Preset::SurroundAmbience: set_solo(4, true); set_solo(5, true); break; /* Ls, Rs */
+			case Preset::HfIntegrity:      break;                                       /* 전체 믹스 */
+			case Preset::None:             break;
+		}
+		rebuild_eq();
+	}
+
+	/** GUI: 전역 모니터 EQ (프리셋과 독립 적용). */
+	void set_global_eq(GlobalEq g) { _global = g; rebuild_eq(); }
+
+	Preset   preset() const { return _preset; }
+	GlobalEq global_eq() const { return _global; }
+
 private:
 	static void zero_matrix(MatrixSrc& m) {
 		for (int c = 0; c < MAX_DCP; ++c)
 			for (int j = 0; j < MAX_DEV; ++j) m.g[c][j] = 0.0f;
+	}
+
+	/* 프리셋+전역을 합쳐 밴드 리스트 구성 후 lock-free 발행 (GUI 스레드). fs=48k 가정. */
+	void rebuild_eq() {
+		roomtune::Biquad bands[MAX_EQ_BANDS];
+		int n = 0;
+		double const fs = 48000.0;
+		switch (_preset) {
+			case Preset::DialogueCheck:
+				bands[n++] = roomtune::pass(300.0, 0.707, fs, /*low=*/false);        /* HP 300 */
+				bands[n++] = roomtune::pass(3400.0, 0.707, fs, /*low=*/true);        /* LP 3400 */
+				bands[n++] = roomtune::peaking(2000.0, 1.0, 3.0, fs);               /* PK 2k +3 */
+				break;
+			case Preset::LfeOnly:
+				bands[n++] = roomtune::pass(120.0, 0.707, fs, /*low=*/true);         /* LP 120 */
+				bands[n++] = roomtune::pass(120.0, 0.707, fs, /*low=*/true);         /* LP 120 ×2 (급준) */
+				break;
+			case Preset::SurroundAmbience:
+				bands[n++] = roomtune::pass(80.0, 0.707, fs, /*low=*/false);         /* HP 80 */
+				bands[n++] = roomtune::shelf(8000.0, 0.707, 3.0, fs, /*low=*/false); /* HS 8k +3 */
+				break;
+			case Preset::HfIntegrity:
+				bands[n++] = roomtune::pass(8000.0, 0.707, fs, /*low=*/false);       /* HP 8k */
+				break;
+			case Preset::None:
+				break;
+		}
+		if (_global == GlobalEq::XCurve) {
+			bands[n++] = roomtune::shelf(2000.0, 0.5, -6.0, fs, /*low=*/false);      /* HS 2k -6 */
+			bands[n++] = roomtune::shelf(10000.0, 0.5, -6.0, fs, /*low=*/false);     /* HS 10k -6 */
+		}
+		/* GlobalEq::Flat / Off 는 추가 밴드 없음 */
+
+		int const w = 1 - _eq_pub.load(std::memory_order_relaxed);
+		for (int b = 0; b < n; ++b) _eq_bands[w][b] = bands[b];
+		_eq_n[w] = n;
+		_eq_pub.store(w, std::memory_order_release);
 	}
 
 	int _dcp_ch = 0, _dev_ch = 0;
@@ -130,6 +224,15 @@ private:
 	std::atomic<int> _pub{0};                 /* 콜백이 읽는 활성 인덱스 */
 	bool _solo[MAX_DCP] = {};
 	bool _mute[MAX_DCP] = {};
+
+	/* 진단 EQ (Phase 5) */
+	Preset _preset = Preset::None;
+	GlobalEq _global = GlobalEq::Off;
+	roomtune::Biquad _eq_bands[2][MAX_EQ_BANDS];
+	int _eq_n[2] = {0, 0};
+	std::atomic<int> _eq_pub{0};
+	roomtune::BiquadState _eq_state[MAX_DEV][MAX_EQ_BANDS];   /* 콜백 전용 필터 상태 */
+	int _eq_active_n = -1;                                    /* 콜백 전용: 마지막 처리 밴드 수 */
 };
 
 #endif

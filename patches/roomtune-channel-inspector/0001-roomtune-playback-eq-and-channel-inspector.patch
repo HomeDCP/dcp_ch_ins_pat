@@ -193,10 +193,10 @@ index 0000000..064f928
 +#endif
 diff --git a/src/wx/channel_inspector.h b/src/wx/channel_inspector.h
 new file mode 100644
-index 0000000..9a33ecb
+index 0000000..b5ed86e
 --- /dev/null
 +++ b/src/wx/channel_inspector.h
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,238 @@
 +/*
 +    RoomTune — DCP 검수용 오디오 채널 인스펙터 (실시간 엔진, 비-UI)
 +    DCP-o-matic 파생물 (GPL-2.0-or-later).
@@ -218,6 +218,7 @@ index 0000000..9a33ecb
 +#ifndef DCPOMATIC_CHANNEL_INSPECTOR_H
 +#define DCPOMATIC_CHANNEL_INSPECTOR_H
 +
++#include "biquad.h"
 +#include <atomic>
 +#include <vector>
 +#include <cstddef>
@@ -229,6 +230,12 @@ index 0000000..9a33ecb
 +public:
 +	static int const MAX_DCP = 16;   /* DCP 오디오 채널 상한(MAX_DCP_AUDIO_CHANNELS) */
 +	static int const MAX_DEV = 16;   /* 출력 장치 채널 상한 */
++	static int const MAX_EQ_BANDS = 6;   /* 프리셋 최대 3 + 전역 X-curve 2 + 여유 */
++
++	/** 진단 프리셋 — 자동 solo 채널 + EQ 밴드 캐스케이드. */
++	enum class Preset { None, DialogueCheck, LfeOnly, SurroundAmbience, HfIntegrity };
++	/** 전역 모니터 EQ (프리셋과 독립 적용). */
++	enum class GlobalEq { Off, Flat, XCurve };
 +
 +	ChannelInspector() {
 +		for (int i = 0; i < MAX_DCP; ++i) _peak[i].store(0.0f, std::memory_order_relaxed);
@@ -315,10 +322,97 @@ index 0000000..9a33ecb
 +		return p > 1e-6f ? 20.0f * std::log10(p) : -120.0f;
 +	}
 +
++	/* ───────── 진단 EQ (Phase 5) ───────── */
++
++	/** 콜백: 다운믹스된 device 채널에 프리셋+전역 EQ 캐스케이드 (무할당·noexcept). */
++	void eq_process(float* out, unsigned int frames) noexcept {
++		int const idx = _eq_pub.load(std::memory_order_acquire);
++		int const n = _eq_n[idx];
++		if (n != _eq_active_n) {
++			/* 밴드 수 변경 → 필터 상태 리셋(콜백 스레드에서만 → 경합 없음, 클릭음 회피). */
++			for (int j = 0; j < MAX_DEV; ++j) {
++				for (int b = 0; b < MAX_EQ_BANDS; ++b) _eq_state[j][b] = roomtune::BiquadState{};
++			}
++			_eq_active_n = n;
++		}
++		if (n == 0) {
++			return;
++		}
++		int const dev = _dev_ch;
++		for (unsigned int f = 0; f < frames; ++f) {
++			float* o = out + static_cast<std::size_t>(f) * dev;
++			for (int j = 0; j < dev; ++j) {
++				double x = o[j];
++				for (int b = 0; b < n; ++b) {
++					x = _eq_bands[idx][b].process(_eq_state[j][b], x);
++				}
++				o[j] = static_cast<float>(x);
++			}
++		}
++	}
++
++	/** GUI: 진단 프리셋 적용 — 기존 solo/mute 초기화 후 프리셋 solo 설정 + EQ 재구성.
++	    (호출자는 이어서 라우팅 매트릭스를 재계산해야 한다.) */
++	void apply_preset(Preset p) {
++		clear();
++		_preset = p;
++		switch (p) {
++			case Preset::DialogueCheck:    set_solo(2, true); break;                    /* C */
++			case Preset::LfeOnly:          set_solo(3, true); break;                    /* LFE */
++			case Preset::SurroundAmbience: set_solo(4, true); set_solo(5, true); break; /* Ls, Rs */
++			case Preset::HfIntegrity:      break;                                       /* 전체 믹스 */
++			case Preset::None:             break;
++		}
++		rebuild_eq();
++	}
++
++	/** GUI: 전역 모니터 EQ (프리셋과 독립 적용). */
++	void set_global_eq(GlobalEq g) { _global = g; rebuild_eq(); }
++
++	Preset   preset() const { return _preset; }
++	GlobalEq global_eq() const { return _global; }
++
 +private:
 +	static void zero_matrix(MatrixSrc& m) {
 +		for (int c = 0; c < MAX_DCP; ++c)
 +			for (int j = 0; j < MAX_DEV; ++j) m.g[c][j] = 0.0f;
++	}
++
++	/* 프리셋+전역을 합쳐 밴드 리스트 구성 후 lock-free 발행 (GUI 스레드). fs=48k 가정. */
++	void rebuild_eq() {
++		roomtune::Biquad bands[MAX_EQ_BANDS];
++		int n = 0;
++		double const fs = 48000.0;
++		switch (_preset) {
++			case Preset::DialogueCheck:
++				bands[n++] = roomtune::pass(300.0, 0.707, fs, /*low=*/false);        /* HP 300 */
++				bands[n++] = roomtune::pass(3400.0, 0.707, fs, /*low=*/true);        /* LP 3400 */
++				bands[n++] = roomtune::peaking(2000.0, 1.0, 3.0, fs);               /* PK 2k +3 */
++				break;
++			case Preset::LfeOnly:
++				bands[n++] = roomtune::pass(120.0, 0.707, fs, /*low=*/true);         /* LP 120 */
++				bands[n++] = roomtune::pass(120.0, 0.707, fs, /*low=*/true);         /* LP 120 ×2 (급준) */
++				break;
++			case Preset::SurroundAmbience:
++				bands[n++] = roomtune::pass(80.0, 0.707, fs, /*low=*/false);         /* HP 80 */
++				bands[n++] = roomtune::shelf(8000.0, 0.707, 3.0, fs, /*low=*/false); /* HS 8k +3 */
++				break;
++			case Preset::HfIntegrity:
++				bands[n++] = roomtune::pass(8000.0, 0.707, fs, /*low=*/false);       /* HP 8k */
++				break;
++			case Preset::None:
++				break;
++		}
++		if (_global == GlobalEq::XCurve) {
++			bands[n++] = roomtune::shelf(2000.0, 0.5, -6.0, fs, /*low=*/false);      /* HS 2k -6 */
++			bands[n++] = roomtune::shelf(10000.0, 0.5, -6.0, fs, /*low=*/false);     /* HS 10k -6 */
++		}
++		/* GlobalEq::Flat / Off 는 추가 밴드 없음 */
++
++		int const w = 1 - _eq_pub.load(std::memory_order_relaxed);
++		for (int b = 0; b < n; ++b) _eq_bands[w][b] = bands[b];
++		_eq_n[w] = n;
++		_eq_pub.store(w, std::memory_order_release);
 +	}
 +
 +	int _dcp_ch = 0, _dev_ch = 0;
@@ -329,15 +423,24 @@ index 0000000..9a33ecb
 +	std::atomic<int> _pub{0};                 /* 콜백이 읽는 활성 인덱스 */
 +	bool _solo[MAX_DCP] = {};
 +	bool _mute[MAX_DCP] = {};
++
++	/* 진단 EQ (Phase 5) */
++	Preset _preset = Preset::None;
++	GlobalEq _global = GlobalEq::Off;
++	roomtune::Biquad _eq_bands[2][MAX_EQ_BANDS];
++	int _eq_n[2] = {0, 0};
++	std::atomic<int> _eq_pub{0};
++	roomtune::BiquadState _eq_state[MAX_DEV][MAX_EQ_BANDS];   /* 콜백 전용 필터 상태 */
++	int _eq_active_n = -1;                                    /* 콜백 전용: 마지막 처리 밴드 수 */
 +};
 +
 +#endif
 diff --git a/src/wx/channel_inspector_dialog.h b/src/wx/channel_inspector_dialog.h
 new file mode 100644
-index 0000000..54cd63b
+index 0000000..96b9974
 --- /dev/null
 +++ b/src/wx/channel_inspector_dialog.h
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,214 @@
 +/*
 +    RoomTune — DCP 검수용 오디오 채널 인스펙터 다이얼로그 (비모달 UI)
 +    DCP-o-matic 파생물 (GPL-2.0-or-later).
@@ -383,6 +486,25 @@ index 0000000..54cd63b
 +		_grid = new wxFlexGridSizer(4, 4, 12);   /* 4열: Label / Solo / Mute / Peak */
 +		_sizer->Add(_grid, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, DCPOMATIC_DIALOG_BORDER);
 +
++		/* ── 진단 EQ (Phase 5) ── */
++		_badge = new wxStaticText(this, wxID_ANY, wxT(""));
++		auto bf = _badge->GetFont();
++		bf.SetWeight(wxFONTWEIGHT_BOLD);
++		_badge->SetFont(bf);
++		_sizer->Add(_badge, 0, wxLEFT | wxRIGHT | wxBOTTOM, DCPOMATIC_DIALOG_BORDER);
++
++		wxString preset_choices[] = { _("None"), _("Dialogue"), _("LFE"), _("Surround"), _("HF") };
++		_preset_radio = new wxRadioBox(this, wxID_ANY, _("Diagnostic preset"), wxDefaultPosition, wxDefaultSize,
++		                               5, preset_choices, 1, wxRA_SPECIFY_ROWS);
++		_preset_radio->Bind(wxEVT_RADIOBOX, [this](wxCommandEvent&) { preset_changed(); });
++		_sizer->Add(_preset_radio, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, DCPOMATIC_DIALOG_BORDER);
++
++		wxString eq_choices[] = { _("Off"), _("Flat"), _("X-curve") };
++		_global_eq_radio = new wxRadioBox(this, wxID_ANY, _("Global monitor EQ"), wxDefaultPosition, wxDefaultSize,
++		                                  3, eq_choices, 1, wxRA_SPECIFY_ROWS);
++		_global_eq_radio->Bind(wxEVT_RADIOBOX, [this](wxCommandEvent&) { global_eq_changed(); });
++		_sizer->Add(_global_eq_radio, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, DCPOMATIC_DIALOG_BORDER);
++
 +		auto clear = new wxButton(this, wxID_ANY, _("Clear solo/mute"));
 +		clear->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { clear_clicked(); });
 +		_sizer->Add(clear, 0, wxLEFT | wxRIGHT | wxBOTTOM, DCPOMATIC_DIALOG_BORDER);
@@ -392,6 +514,9 @@ index 0000000..54cd63b
 +		Bind(wxEVT_TIMER, [this](wxTimerEvent&) { on_timer(); });
 +		Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent& ev) {
 +			_timer.Stop();
++			/* 닫을 때 프리셋·전역 EQ·solo/mute 초기화 → 다음에 깨끗이 열림 */
++			_viewer.inspector_apply_preset(ChannelInspector::Preset::None);
++			_viewer.inspector_set_global_eq(ChannelInspector::GlobalEq::Off);
 +			_viewer.inspector_set_active(false);
 +			Hide();
 +			ev.Veto();   /* wx_ptr 이 재사용하므로 파괴하지 않고 숨김 */
@@ -404,6 +529,9 @@ index 0000000..54cd63b
 +	void open()
 +	{
 +		_viewer.inspector_set_active(true);
++		_preset_radio->SetSelection(0);       /* 열 때 깨끗한 상태로 */
++		_global_eq_radio->SetSelection(0);
++		_badge->SetLabel(wxT(""));
 +		rebuild_rows();
 +		_timer.Start(100);
 +		wxFrame::Show(true);
@@ -437,6 +565,8 @@ index 0000000..54cd63b
 +			auto solo = new wxCheckBox(this, wxID_ANY, _("Solo"));
 +			auto mute = new wxCheckBox(this, wxID_ANY, _("Mute"));
 +			auto peak = new wxStaticText(this, wxID_ANY, wxT("-inf dB"));
++			solo->SetValue(_viewer.inspector_solo(c));   /* 프리셋이 설정한 solo 를 반영 */
++			mute->SetValue(_viewer.inspector_mute(c));
 +			solo->Bind(wxEVT_CHECKBOX, [this, c](wxCommandEvent& ev) { _viewer.inspector_set_solo(c, ev.IsChecked()); });
 +			mute->Bind(wxEVT_CHECKBOX, [this, c](wxCommandEvent& ev) { _viewer.inspector_set_mute(c, ev.IsChecked()); });
 +
@@ -455,13 +585,53 @@ index 0000000..54cd63b
 +
 +	void clear_clicked()
 +	{
-+		_viewer.inspector_clear();
-+		for (auto b: _solo) {
-+			b->SetValue(false);
++		/* solo/mute + 프리셋 모두 초기화 (전역 EQ 는 유지). */
++		_viewer.inspector_apply_preset(ChannelInspector::Preset::None);
++		_preset_radio->SetSelection(0);
++		update_badge();
++		rebuild_rows();
++	}
++
++	void preset_changed()
++	{
++		static ChannelInspector::Preset const map[] = {
++			ChannelInspector::Preset::None,
++			ChannelInspector::Preset::DialogueCheck,
++			ChannelInspector::Preset::LfeOnly,
++			ChannelInspector::Preset::SurroundAmbience,
++			ChannelInspector::Preset::HfIntegrity,
++		};
++		int sel = _preset_radio->GetSelection();
++		if (sel < 0 || sel > 4) sel = 0;
++		_viewer.inspector_apply_preset(map[sel]);
++		update_badge();
++		rebuild_rows();   /* 프리셋의 자동 solo 를 체크박스에 반영 */
++	}
++
++	void global_eq_changed()
++	{
++		static ChannelInspector::GlobalEq const map[] = {
++			ChannelInspector::GlobalEq::Off,
++			ChannelInspector::GlobalEq::Flat,
++			ChannelInspector::GlobalEq::XCurve,
++		};
++		int sel = _global_eq_radio->GetSelection();
++		if (sel < 0 || sel > 2) sel = 0;
++		_viewer.inspector_set_global_eq(map[sel]);
++	}
++
++	void update_badge()
++	{
++		wxString t;
++		switch (_viewer.inspector_preset()) {
++			case ChannelInspector::Preset::DialogueCheck:    t = _("DIAGNOSTIC: Dialogue check"); break;
++			case ChannelInspector::Preset::LfeOnly:          t = _("DIAGNOSTIC: LFE only"); break;
++			case ChannelInspector::Preset::SurroundAmbience: t = _("DIAGNOSTIC: Surround ambience"); break;
++			case ChannelInspector::Preset::HfIntegrity:      t = _("DIAGNOSTIC: HF integrity"); break;
++			case ChannelInspector::Preset::None:             t = wxT(""); break;
 +		}
-+		for (auto b: _mute) {
-+			b->SetValue(false);
-+		}
++		_badge->SetLabel(t);
++		_sizer->Layout();
 +	}
 +
 +	void on_timer()
@@ -479,11 +649,14 @@ index 0000000..54cd63b
 +	std::vector<wxCheckBox*> _solo;
 +	std::vector<wxCheckBox*> _mute;
 +	std::vector<wxStaticText*> _peak;
++	wxRadioBox* _preset_radio = nullptr;
++	wxRadioBox* _global_eq_radio = nullptr;
++	wxStaticText* _badge = nullptr;
 +};
 +
 +#endif
 diff --git a/src/wx/film_viewer.cc b/src/wx/film_viewer.cc
-index dcee453..dd7a4c5 100644
+index dcee453..f3f2874 100644
 --- a/src/wx/film_viewer.cc
 +++ b/src/wx/film_viewer.cc
 @@ -34,6 +34,7 @@
@@ -601,7 +774,7 @@ index dcee453..dd7a4c5 100644
  void
  FilmViewer::set_outline_content(bool o)
  {
-@@ -738,13 +821,32 @@ FilmViewer::audio_callback(void* out_p, unsigned int frames)
+@@ -738,13 +821,33 @@ FilmViewer::audio_callback(void* out_p, unsigned int frames)
  		_stream_time = audio.getStreamTime();
  	}
  
@@ -624,6 +797,7 @@ index dcee453..dd7a4c5 100644
 -		/* The audio we just got was (very) late; drop it and get some more. */
 +		_inspector.meter(mid, frames);
 +		_inspector.downmix(mid, reinterpret_cast<float*>(out_p), frames);
++		_inspector.eq_process(reinterpret_cast<float*>(out_p), frames);   /* 진단 EQ (Phase 5) */
 +	} else {
 +		while (true) {
 +			auto t = _butler->get_audio(Butler::Behaviour::NON_BLOCKING, reinterpret_cast<float*>(out_p), frames);
@@ -641,7 +815,7 @@ index dcee453..dd7a4c5 100644
  
  	if (auto lm = boost::mutex::scoped_lock(_latency_history_mutex, boost::try_to_lock)) {
 diff --git a/src/wx/film_viewer.h b/src/wx/film_viewer.h
-index 6d08df3..a241824 100644
+index 6d08df3..c8c9933 100644
 --- a/src/wx/film_viewer.h
 +++ b/src/wx/film_viewer.h
 @@ -24,8 +24,14 @@
@@ -659,7 +833,7 @@ index 6d08df3..a241824 100644
  #include "lib/change_signaller.h"
  #include "lib/config.h"
  #include "lib/film_property.h"
-@@ -126,6 +132,24 @@ public:
+@@ -126,6 +132,29 @@ public:
  
  	int audio_callback(void* out, unsigned int frames);
  
@@ -680,11 +854,16 @@ index 6d08df3..a241824 100644
 +	bool inspector_mute(int c) const { return _inspector.mute(c); }
 +	bool inspector_has_solo() const { return _inspector.has_solo(); }
 +	float inspector_peak_dbfs(int c) const { return _inspector.peak_dbfs(c); }
++	/* 진단 EQ (Phase 5): 프리셋은 solo 를 바꾸므로 매트릭스 재계산, 전역 EQ 는 EQ 만. */
++	void inspector_apply_preset(ChannelInspector::Preset p) { _inspector.apply_preset(p); inspector_recompute_matrix(); }
++	void inspector_set_global_eq(ChannelInspector::GlobalEq g) { _inspector.set_global_eq(g); }
++	ChannelInspector::Preset inspector_preset() const { return _inspector.preset(); }
++	ChannelInspector::GlobalEq inspector_global_eq() const { return _inspector.global_eq(); }
 +
  	StateTimer const & state_timer() const {
  		return _video_view->state_timer();
  	}
-@@ -183,6 +207,7 @@ private:
+@@ -183,6 +212,7 @@ private:
  	void destroy_butler();
  	void create_butler();
  	void destroy_and_maybe_create_butler();
@@ -692,7 +871,7 @@ index 6d08df3..a241824 100644
  	void config_changed(Config::Property);
  	void film_length_change();
  	void ui_finished();
-@@ -200,6 +225,12 @@ private:
+@@ -200,6 +230,12 @@ private:
  	std::vector<int> _pending_player_changes;
  
  	int _audio_channels = 0;
@@ -705,7 +884,7 @@ index 6d08df3..a241824 100644
  	unsigned int _audio_block_size = 1024;
  	bool _playing = false;
  	int _suspended = 0;
-@@ -242,3 +273,5 @@ private:
+@@ -242,3 +278,5 @@ private:
  
  	boost::signals2::scoped_connection _config_changed_connection;
  };

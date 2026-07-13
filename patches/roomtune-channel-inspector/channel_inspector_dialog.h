@@ -43,6 +43,25 @@ public:
 		_grid = new wxFlexGridSizer(4, 4, 12);   /* 4열: Label / Solo / Mute / Peak */
 		_sizer->Add(_grid, 1, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, DCPOMATIC_DIALOG_BORDER);
 
+		/* ── 진단 EQ (Phase 5) ── */
+		_badge = new wxStaticText(this, wxID_ANY, wxT(""));
+		auto bf = _badge->GetFont();
+		bf.SetWeight(wxFONTWEIGHT_BOLD);
+		_badge->SetFont(bf);
+		_sizer->Add(_badge, 0, wxLEFT | wxRIGHT | wxBOTTOM, DCPOMATIC_DIALOG_BORDER);
+
+		wxString preset_choices[] = { _("None"), _("Dialogue"), _("LFE"), _("Surround"), _("HF") };
+		_preset_radio = new wxRadioBox(this, wxID_ANY, _("Diagnostic preset"), wxDefaultPosition, wxDefaultSize,
+		                               5, preset_choices, 1, wxRA_SPECIFY_ROWS);
+		_preset_radio->Bind(wxEVT_RADIOBOX, [this](wxCommandEvent&) { preset_changed(); });
+		_sizer->Add(_preset_radio, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, DCPOMATIC_DIALOG_BORDER);
+
+		wxString eq_choices[] = { _("Off"), _("Flat"), _("X-curve") };
+		_global_eq_radio = new wxRadioBox(this, wxID_ANY, _("Global monitor EQ"), wxDefaultPosition, wxDefaultSize,
+		                                  3, eq_choices, 1, wxRA_SPECIFY_ROWS);
+		_global_eq_radio->Bind(wxEVT_RADIOBOX, [this](wxCommandEvent&) { global_eq_changed(); });
+		_sizer->Add(_global_eq_radio, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, DCPOMATIC_DIALOG_BORDER);
+
 		auto clear = new wxButton(this, wxID_ANY, _("Clear solo/mute"));
 		clear->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { clear_clicked(); });
 		_sizer->Add(clear, 0, wxLEFT | wxRIGHT | wxBOTTOM, DCPOMATIC_DIALOG_BORDER);
@@ -52,6 +71,9 @@ public:
 		Bind(wxEVT_TIMER, [this](wxTimerEvent&) { on_timer(); });
 		Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent& ev) {
 			_timer.Stop();
+			/* 닫을 때 프리셋·전역 EQ·solo/mute 초기화 → 다음에 깨끗이 열림 */
+			_viewer.inspector_apply_preset(ChannelInspector::Preset::None);
+			_viewer.inspector_set_global_eq(ChannelInspector::GlobalEq::Off);
 			_viewer.inspector_set_active(false);
 			Hide();
 			ev.Veto();   /* wx_ptr 이 재사용하므로 파괴하지 않고 숨김 */
@@ -64,6 +86,9 @@ public:
 	void open()
 	{
 		_viewer.inspector_set_active(true);
+		_preset_radio->SetSelection(0);       /* 열 때 깨끗한 상태로 */
+		_global_eq_radio->SetSelection(0);
+		_badge->SetLabel(wxT(""));
 		rebuild_rows();
 		_timer.Start(100);
 		wxFrame::Show(true);
@@ -97,6 +122,8 @@ private:
 			auto solo = new wxCheckBox(this, wxID_ANY, _("Solo"));
 			auto mute = new wxCheckBox(this, wxID_ANY, _("Mute"));
 			auto peak = new wxStaticText(this, wxID_ANY, wxT("-inf dB"));
+			solo->SetValue(_viewer.inspector_solo(c));   /* 프리셋이 설정한 solo 를 반영 */
+			mute->SetValue(_viewer.inspector_mute(c));
 			solo->Bind(wxEVT_CHECKBOX, [this, c](wxCommandEvent& ev) { _viewer.inspector_set_solo(c, ev.IsChecked()); });
 			mute->Bind(wxEVT_CHECKBOX, [this, c](wxCommandEvent& ev) { _viewer.inspector_set_mute(c, ev.IsChecked()); });
 
@@ -115,13 +142,53 @@ private:
 
 	void clear_clicked()
 	{
-		_viewer.inspector_clear();
-		for (auto b: _solo) {
-			b->SetValue(false);
+		/* solo/mute + 프리셋 모두 초기화 (전역 EQ 는 유지). */
+		_viewer.inspector_apply_preset(ChannelInspector::Preset::None);
+		_preset_radio->SetSelection(0);
+		update_badge();
+		rebuild_rows();
+	}
+
+	void preset_changed()
+	{
+		static ChannelInspector::Preset const map[] = {
+			ChannelInspector::Preset::None,
+			ChannelInspector::Preset::DialogueCheck,
+			ChannelInspector::Preset::LfeOnly,
+			ChannelInspector::Preset::SurroundAmbience,
+			ChannelInspector::Preset::HfIntegrity,
+		};
+		int sel = _preset_radio->GetSelection();
+		if (sel < 0 || sel > 4) sel = 0;
+		_viewer.inspector_apply_preset(map[sel]);
+		update_badge();
+		rebuild_rows();   /* 프리셋의 자동 solo 를 체크박스에 반영 */
+	}
+
+	void global_eq_changed()
+	{
+		static ChannelInspector::GlobalEq const map[] = {
+			ChannelInspector::GlobalEq::Off,
+			ChannelInspector::GlobalEq::Flat,
+			ChannelInspector::GlobalEq::XCurve,
+		};
+		int sel = _global_eq_radio->GetSelection();
+		if (sel < 0 || sel > 2) sel = 0;
+		_viewer.inspector_set_global_eq(map[sel]);
+	}
+
+	void update_badge()
+	{
+		wxString t;
+		switch (_viewer.inspector_preset()) {
+			case ChannelInspector::Preset::DialogueCheck:    t = _("DIAGNOSTIC: Dialogue check"); break;
+			case ChannelInspector::Preset::LfeOnly:          t = _("DIAGNOSTIC: LFE only"); break;
+			case ChannelInspector::Preset::SurroundAmbience: t = _("DIAGNOSTIC: Surround ambience"); break;
+			case ChannelInspector::Preset::HfIntegrity:      t = _("DIAGNOSTIC: HF integrity"); break;
+			case ChannelInspector::Preset::None:             t = wxT(""); break;
 		}
-		for (auto b: _mute) {
-			b->SetValue(false);
-		}
+		_badge->SetLabel(t);
+		_sizer->Layout();
 	}
 
 	void on_timer()
@@ -139,6 +206,9 @@ private:
 	std::vector<wxCheckBox*> _solo;
 	std::vector<wxCheckBox*> _mute;
 	std::vector<wxStaticText*> _peak;
+	wxRadioBox* _preset_radio = nullptr;
+	wxRadioBox* _global_eq_radio = nullptr;
+	wxStaticText* _badge = nullptr;
 };
 
 #endif

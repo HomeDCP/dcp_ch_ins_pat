@@ -5,7 +5,7 @@ DCP-o-matic Player v2.18.44 재생 경로에 두 기능을 더한다:
 1. **재생 룸튜닝 EQ**(`View > Room EQ (test)`) — REW/EQ-APO 측정 파일 기반 채널별 biquad EQ.
    내보내는 DCP엔 영향 없음(재생 전용). 상세: `docs/측정-룸튜닝-워크플로.md`.
 2. **채널 인스펙터**(`Tools > Channel inspector...`) — DCP 채널 매핑을 실측 검증하는 검수 도구.
-   채널별 **solo/mute** + **실시간 피크 미터**(dBFS).
+   채널별 **solo/mute** + **실시간 피크 미터**(dBFS) + **진단 EQ 프리셋**(Dialogue/LFE/Surround/HF) + 전역 X-curve/Flat.
 
 > 이 패치는 `patches/roomtune-playback-eq/`(EQ 단독, self-contained `room_eq.h`)의 **상위집합**이다.
 > 여기서는 biquad DSP 코어를 `biquad.h`로 분리해 EQ와 인스펙터가 공유한다. 둘 중 하나만 적용할 것
@@ -17,8 +17,8 @@ DCP-o-matic Player v2.18.44 재생 경로에 두 기능을 더한다:
 |---|---|
 | `src/wx/biquad.h` (신규) | 공유 RBJ biquad 코어(`roomtune::` 네임스페이스). EQ·인스펙터 공용. |
 | `src/wx/room_eq.h` (신규, biquad.h 사용) | 재생 EQ 파서+DSP. 측정 파일 로더. |
-| `src/wx/channel_inspector.h` (신규) | 채널 인스펙터 실시간 엔진(wx 비의존). solo/mute·피크·무할당 다운믹스 매트릭스(SPSC 더블버퍼). |
-| `src/wx/channel_inspector_dialog.h` (신규) | 비모달 UI(채널행 solo/mute 체크박스 + 피크 미터, 헤더온리 **wxFrame**). |
+| `src/wx/channel_inspector.h` (신규) | 채널 인스펙터 실시간 엔진(wx 비의존). solo/mute·피크·무할당 다운믹스 매트릭스 + 진단 EQ(프리셋/전역, biquad.h 캐스케이드), 모두 SPSC 더블버퍼. |
+| `src/wx/channel_inspector_dialog.h` (신규) | 비모달 UI(채널행 solo/mute + 피크 미터 + 진단 프리셋/전역 EQ 라디오 + 배지, 헤더온리 **wxFrame**). |
 | `src/wx/film_viewer.{h,cc}` (수정) | 지연 identity Butler 배선 + audio_callback 분기 + 포워더. include guard 추가. |
 | `src/tools/dcpomatic_player.cc` (수정) | `Tools > Channel inspector...` 메뉴/Bind/다이얼로그. |
 
@@ -48,20 +48,21 @@ python3 waf build      # ./waf 는 shebang이 python 을 찾으므로 python3 �
 ```
 증분 빌드 성공 검증됨(2026-07-12, `[518/518] dcpomatic2_player`, 10s).
 
-## 검증 상태 (2026-07-13)
+## 검증 상태 (2026-07-14)
 
 - **헤드리스 단위검증 PASS:**
   - biquad.h 분리 후 룸EQ 응답 무변화(회귀 하니스 ALL PASS).
   - 채널 인스펙터 엔진 16/16 PASS — downmix 정확성, 피크미터, solo/mute, lock-free publish 스위칭, 채널 클램프, 비활성 폴백.
-- **실기 GUI 검증 완료(2026-07-13):** `Tools > Channel inspector...` — solo/mute 실시간 반영·채널 격리 확인.
+  - 진단 EQ 프리셋 하니스 ALL PASS — 프리셋별 주파수응답 §5 정합(Dialogue HP/LP/PK, LFE LP, Surround HP/HS, HF HP, X-curve 2-shelf), 프리셋+전역 독립 적용, 자동 solo 설정.
+- **실기 GUI 검증 완료(2026-07-13~14):** solo/mute 실시간 반영·채널 격리 + 진단 EQ 프리셋 4종·전역 X-curve·배지 (스테레오·**5.1 소스**) 확인, 창 안정.
 - **실기 중 발견·수정한 이슈 2건:**
   1. **창이 저절로 닫힘** — macOS `wxDialog`가 자식 체크박스의 command 이벤트를 취소(close)로 오인 →
      `wxEVT_CLOSE_WINDOW`에서 인스펙터가 비활성화되어 solo/mute가 즉시 풀림. **`wxFrame`으로 전환**해 해결.
   2. **solo가 양쪽으로 스플릿** — 초기 solo가 모노합(×0.707)이라 격리 채널이 양쪽 스피커로 나뉘어 음량↓·직관 위배.
      **solo-in-place**(원래 라우팅 유지)로 변경해 해결.
 
-## v1 범위 / 다음
+## 범위
 
-- **v1(이 패치):** 채널 검수 코어 — solo/mute + 피크미터.
-- **다음 반복:** 진단 EQ 프리셋(Dialogue/LFE/Surround/HF) + 전역 X-curve/Flat. 설계 완본:
-  `docs/채널-인스펙터-설계.md` §5·Phase 5. biquad.h 코어는 이미 공유 준비됨.
+- **채널 검수 코어:** solo/mute(solo-in-place) + 피크미터.
+- **진단 EQ 프리셋(Phase 5, 완료):** Dialogue(C solo + HP300/LP3400/PK2k+3) · LFE(LP120×2) · Surround(Ls+Rs solo + HP80/HS8k+3) · HF(HP8k). 전역 모니터 EQ Off/Flat/X-curve(2k·10k HS −6, 2-shelf 근사). **프리셋+전역 독립 캐스케이드.** 다이얼로그 닫으면 초기화. 밴드 발행은 매트릭스와 동일 SPSC 더블버퍼, 밴드 수 변경 시만 필터 상태 리셋(클릭음 회피). 계수 상세: `docs/채널-인스펙터-설계.md` §5.
+- **향후 후보:** X-curve FIR 정밀화, 채널별 EQ, 피크 홀드/디케이.

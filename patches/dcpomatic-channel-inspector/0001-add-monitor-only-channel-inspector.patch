@@ -1,0 +1,695 @@
+diff --git a/src/tools/dcpomatic_player.cc b/src/tools/dcpomatic_player.cc
+index 688decc..6e44515 100644
+--- a/src/tools/dcpomatic_player.cc
++++ b/src/tools/dcpomatic_player.cc
+@@ -20,6 +20,7 @@
+ 
+ #include "wx/about_dialog.h"
+ #include "wx/audio_dialog.h"
++#include "wx/channel_inspector_dialog.h"
+ #include "wx/file_dialog.h"
+ #include "wx/film_viewer.h"
+ #include "wx/i18n_setup.h"
+@@ -143,6 +144,7 @@ enum {
+ 	ID_tools_check_for_updates,
+ 	ID_tools_timing,
+ 	ID_tools_system_information,
++	ID_tools_channel_inspector,
+ 	/* IDs for shortcuts (with no associated menu item) */
+ 	ID_start_stop,
+ 	ID_go_back_frame,
+@@ -253,6 +255,7 @@ public:
+ 		Bind(wxEVT_MENU, boost::bind(&DOMFrame::tools_check_for_updates, this), ID_tools_check_for_updates);
+ 		Bind(wxEVT_MENU, boost::bind(&DOMFrame::tools_timing, this), ID_tools_timing);
+ 		Bind(wxEVT_MENU, boost::bind(&DOMFrame::tools_system_information, this), ID_tools_system_information);
++		Bind(wxEVT_MENU, boost::bind(&DOMFrame::tools_channel_inspector, this), ID_tools_channel_inspector);
+ 
+ 		Bind(wxEVT_CLOSE_WINDOW, boost::bind(&DOMFrame::close, this, _1));
+ 
+@@ -737,6 +740,7 @@ private:
+ 		tools->Append(ID_tools_check_for_updates, _("Check for updates"));
+ 		tools->Append(ID_tools_timing, _("Timing..."));
+ 		tools->Append(ID_tools_system_information, _("System information..."));
++		tools->Append(ID_tools_channel_inspector, _("Channel inspector..."));
+ 
+ 		auto help = new wxMenu;
+ #ifdef __WXOSX__
+@@ -1079,6 +1083,15 @@ private:
+ 		_system_information_dialog->Show();
+ 	}
+ 
++	void tools_channel_inspector()
++	{
++		if (!_channel_inspector_dialog) {
++			_channel_inspector_dialog.reset(this, _viewer);
++		}
++
++		_channel_inspector_dialog->open();
++	}
++
+ 	void help_about()
+ 	{
+ 		AboutDialog dialog(this);
+@@ -1301,6 +1314,7 @@ private:
+ 	FilmViewer _viewer;
+ 	Controls* _controls;
+ 	wx_ptr<SystemInformationDialog> _system_information_dialog;
++	wx_ptr<ChannelInspectorDialog> _channel_inspector_dialog;
+ 	std::shared_ptr<Film> _film;
+ 	boost::signals2::scoped_connection _config_changed_connection;
+ 	boost::signals2::scoped_connection _examine_job_connection;
+diff --git a/src/wx/channel_inspector.h b/src/wx/channel_inspector.h
+new file mode 100644
+index 0000000..ad71d4d
+--- /dev/null
++++ b/src/wx/channel_inspector.h
+@@ -0,0 +1,209 @@
++/*
++    Copyright (C) 2026
++
++    This file is part of DCP-o-matic.
++
++    DCP-o-matic is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 2 of the License, or
++    (at your option) any later version.
++
++    DCP-o-matic is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with DCP-o-matic.  If not, see <http://www.gnu.org/licenses/>.
++
++*/
++
++
++#ifndef DCPOMATIC_CHANNEL_INSPECTOR_H
++#define DCPOMATIC_CHANNEL_INSPECTOR_H
++
++
++#include <algorithm>
++#include <atomic>
++#include <cmath>
++#include <cstddef>
++#include <vector>
++
++
++class ChannelInspector
++{
++public:
++	static constexpr int MAX_DCP = 16;
++	static constexpr int MAX_DEV = 16;
++
++	struct Matrix {
++		float gain[MAX_DCP][MAX_DEV];
++	};
++
++	ChannelInspector()
++	{
++		for (auto& peak: _peak) {
++			peak.store(0.0f, std::memory_order_relaxed);
++		}
++		for (auto& row: _matrix) {
++			for (auto& value: row) {
++				value.store(0.0f, std::memory_order_relaxed);
++			}
++		}
++	}
++
++	void configure(int dcp_channels, int device_channels, unsigned int block_size)
++	{
++		_dcp_channels = std::max(0, std::min(dcp_channels, MAX_DCP));
++		_device_channels = std::max(0, std::min(device_channels, MAX_DEV));
++		_mid_frames = block_size;
++		_mid.assign(static_cast<std::size_t>(block_size) * MAX_DCP, 0.0f);
++		for (auto& peak: _peak) {
++			peak.store(0.0f, std::memory_order_relaxed);
++		}
++	}
++
++	bool active_pipeline() const
++	{
++		return _dcp_channels > 0 && _device_channels > 0 && !_mid.empty();
++	}
++
++	bool can_process(unsigned int frames) const
++	{
++		return active_pipeline() && frames <= _mid_frames;
++	}
++
++	int dcp_channels() const
++	{
++		return _dcp_channels;
++	}
++
++	int device_channels() const
++	{
++		return _device_channels;
++	}
++
++	float* mid_buffer() noexcept
++	{
++		return _mid.data();
++	}
++
++	void meter(float const* mid, unsigned int frames) noexcept
++	{
++		for (int c = 0; c < _dcp_channels; ++c) {
++			float peak = 0.0f;
++			for (unsigned int f = 0; f < frames; ++f) {
++				auto const value = std::fabs(mid[static_cast<std::size_t>(f) * _dcp_channels + c]);
++				if (value > peak) {
++					peak = value;
++				}
++			}
++			_peak[c].store(peak, std::memory_order_relaxed);
++		}
++	}
++
++	void downmix(float const* mid, float* out, unsigned int frames) const noexcept
++	{
++		for (unsigned int f = 0; f < frames; ++f) {
++			auto const in = mid + static_cast<std::size_t>(f) * _dcp_channels;
++			auto o = out + static_cast<std::size_t>(f) * _device_channels;
++
++			for (int j = 0; j < _device_channels; ++j) {
++				o[j] = 0.0f;
++			}
++
++			for (int c = 0; c < _dcp_channels; ++c) {
++				auto const sample = in[c];
++				for (int j = 0; j < _device_channels; ++j) {
++					auto const gain = _matrix[c][j].load(std::memory_order_relaxed);
++					if (gain != 0.0f) {
++						o[j] += sample * gain;
++					}
++				}
++			}
++		}
++	}
++
++	void set_solo(int channel, bool active)
++	{
++		if (channel >= 0 && channel < MAX_DCP) {
++			_solo[channel] = active;
++		}
++	}
++
++	void set_mute(int channel, bool active)
++	{
++		if (channel >= 0 && channel < MAX_DCP) {
++			_mute[channel] = active;
++		}
++	}
++
++	bool solo(int channel) const
++	{
++		return channel >= 0 && channel < MAX_DCP && _solo[channel];
++	}
++
++	bool mute(int channel) const
++	{
++		return channel >= 0 && channel < MAX_DCP && _mute[channel];
++	}
++
++	bool has_solo() const
++	{
++		for (auto active: _solo) {
++			if (active) {
++				return true;
++			}
++		}
++		return false;
++	}
++
++	void clear()
++	{
++		for (int i = 0; i < MAX_DCP; ++i) {
++			_solo[i] = false;
++			_mute[i] = false;
++		}
++	}
++
++	void publish(Matrix const& matrix)
++	{
++		for (int c = 0; c < MAX_DCP; ++c) {
++			for (int j = 0; j < MAX_DEV; ++j) {
++				_matrix[c][j].store(matrix.gain[c][j], std::memory_order_relaxed);
++			}
++		}
++	}
++
++	float peak_dbfs(int channel) const
++	{
++		if (channel < 0 || channel >= MAX_DCP) {
++			return -120.0f;
++		}
++
++		auto const peak = _peak[channel].load(std::memory_order_relaxed);
++		return peak > 1e-6f ? 20.0f * std::log10(peak) : -120.0f;
++	}
++
++private:
++	static void zero(Matrix& matrix)
++	{
++		for (auto& row: matrix.gain) {
++			for (auto& value: row) {
++				value = 0.0f;
++			}
++		}
++	}
++
++	int _dcp_channels = 0;
++	int _device_channels = 0;
++	unsigned int _mid_frames = 0;
++	std::vector<float> _mid;
++	std::atomic<float> _peak[MAX_DCP];
++	std::atomic<float> _matrix[MAX_DCP][MAX_DEV];
++	bool _solo[MAX_DCP] = {};
++	bool _mute[MAX_DCP] = {};
++};
++
++
++#endif
+diff --git a/src/wx/channel_inspector_dialog.h b/src/wx/channel_inspector_dialog.h
+new file mode 100644
+index 0000000..f099f36
+--- /dev/null
++++ b/src/wx/channel_inspector_dialog.h
+@@ -0,0 +1,172 @@
++/*
++    Copyright (C) 2026
++
++    This file is part of DCP-o-matic.
++
++    DCP-o-matic is free software; you can redistribute it and/or modify
++    it under the terms of the GNU General Public License as published by
++    the Free Software Foundation; either version 2 of the License, or
++    (at your option) any later version.
++
++    DCP-o-matic is distributed in the hope that it will be useful,
++    but WITHOUT ANY WARRANTY; without even the implied warranty of
++    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++    GNU General Public License for more details.
++
++    You should have received a copy of the GNU General Public License
++    along with DCP-o-matic.  If not, see <http://www.gnu.org/licenses/>.
++
++*/
++
++
++#ifndef DCPOMATIC_CHANNEL_INSPECTOR_DIALOG_H
++#define DCPOMATIC_CHANNEL_INSPECTOR_DIALOG_H
++
++
++#include "film_viewer.h"
++#include "wx_util.h"
++#include "lib/film.h"
++#include "lib/util.h"
++#include <dcp/warnings.h>
++LIBDCP_DISABLE_WARNINGS
++#include <wx/wx.h>
++LIBDCP_ENABLE_WARNINGS
++#include <algorithm>
++#include <list>
++#include <vector>
++
++
++class ChannelInspectorDialog : public wxFrame
++{
++public:
++	ChannelInspectorDialog(wxWindow* parent, FilmViewer& viewer)
++		: wxFrame(parent, wxID_ANY, _("Channel inspector"), wxDefaultPosition, wxDefaultSize, wxDEFAULT_FRAME_STYLE | wxFRAME_FLOAT_ON_PARENT)
++		, _viewer(viewer)
++		, _timer(this)
++	{
++		_sizer = new wxBoxSizer(wxVERTICAL);
++		_grid = new wxFlexGridSizer(4, 4, 12);
++		_sizer->Add(_grid, 1, wxEXPAND | wxALL, DCPOMATIC_DIALOG_BORDER);
++
++		auto clear = new wxButton(this, wxID_ANY, _("Clear solo/mute"));
++		clear->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { clear_clicked(); });
++		_sizer->Add(clear, 0, wxLEFT | wxRIGHT | wxBOTTOM, DCPOMATIC_DIALOG_BORDER);
++
++		SetSizerAndFit(_sizer);
++
++		Bind(wxEVT_TIMER, [this](wxTimerEvent&) { on_timer(); });
++		Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent& ev) {
++			_timer.Stop();
++			_viewer.inspector_set_active(false);
++			Hide();
++			ev.Veto();
++		});
++	}
++
++	void open()
++	{
++		_viewer.inspector_set_active(true);
++		rebuild_rows();
++		_timer.Start(100);
++		wxFrame::Show(true);
++		Raise();
++	}
++
++private:
++	void rebuild_rows()
++	{
++		_grid->Clear(true);
++		_solo.clear();
++		_mute.clear();
++		_peak.clear();
++
++		add_header(_("Channel"));
++		add_header(_("Solo"));
++		add_header(_("Mute"));
++		add_header(_("Peak"));
++
++		std::list<int> mapped;
++		if (auto film = _viewer.film()) {
++			mapped = film->mapped_audio_channels();
++		}
++
++		_last_dcp_channels = _viewer.inspector_dcp_channels();
++		for (int c = 0; c < _last_dcp_channels; ++c) {
++			auto const is_mapped = std::find(mapped.begin(), mapped.end(), c) != mapped.end();
++			auto label_text = wxString::Format(wxT("%d  "), c) + std_to_wx(short_audio_channel_name(c));
++			if (!is_mapped) {
++				label_text += wxT("  (unmapped)");
++			}
++
++			auto label = new wxStaticText(this, wxID_ANY, label_text);
++			if (!is_mapped) {
++				label->Enable(false);
++			}
++
++			auto solo = new wxCheckBox(this, wxID_ANY, wxT(""));
++			auto mute = new wxCheckBox(this, wxID_ANY, wxT(""));
++			auto peak = new wxStaticText(this, wxID_ANY, wxT("-inf dB"));
++
++			solo->SetValue(_viewer.inspector_solo(c));
++			mute->SetValue(_viewer.inspector_mute(c));
++			solo->Bind(wxEVT_CHECKBOX, [this, c](wxCommandEvent& ev) { _viewer.inspector_set_solo(c, ev.IsChecked()); });
++			mute->Bind(wxEVT_CHECKBOX, [this, c](wxCommandEvent& ev) { _viewer.inspector_set_mute(c, ev.IsChecked()); });
++
++			_grid->Add(label, 0, wxALIGN_CENTER_VERTICAL);
++			_grid->Add(solo, 0, wxALIGN_CENTER);
++			_grid->Add(mute, 0, wxALIGN_CENTER);
++			_grid->Add(peak, 0, wxALIGN_CENTER_VERTICAL);
++
++			_solo.push_back(solo);
++			_mute.push_back(mute);
++			_peak.push_back(peak);
++		}
++
++		_sizer->Layout();
++		Fit();
++	}
++
++	void add_header(wxString const& text)
++	{
++		auto header = new wxStaticText(this, wxID_ANY, text);
++		auto font = header->GetFont();
++		font.SetWeight(wxFONTWEIGHT_BOLD);
++		header->SetFont(font);
++		_grid->Add(header, 0, wxALIGN_CENTER_VERTICAL);
++	}
++
++	void clear_clicked()
++	{
++		_viewer.inspector_clear();
++		for (auto button: _solo) {
++			button->SetValue(false);
++		}
++		for (auto button: _mute) {
++			button->SetValue(false);
++		}
++	}
++
++	void on_timer()
++	{
++		if (_viewer.inspector_dcp_channels() != _last_dcp_channels) {
++			rebuild_rows();
++		}
++
++		for (size_t c = 0; c < _peak.size(); ++c) {
++			auto const db = _viewer.inspector_peak_dbfs(static_cast<int>(c));
++			_peak[c]->SetLabel(db <= -119.0f ? wxString(wxT("-inf dB")) : wxString::Format(wxT("%.1f dB"), db));
++		}
++	}
++
++	FilmViewer& _viewer;
++	wxTimer _timer;
++	wxBoxSizer* _sizer = nullptr;
++	wxFlexGridSizer* _grid = nullptr;
++	std::vector<wxCheckBox*> _solo;
++	std::vector<wxCheckBox*> _mute;
++	std::vector<wxStaticText*> _peak;
++	int _last_dcp_channels = -1;
++};
++
++
++#endif
+diff --git a/src/wx/film_viewer.cc b/src/wx/film_viewer.cc
+index dcee453..4f2004f 100644
+--- a/src/wx/film_viewer.cc
++++ b/src/wx/film_viewer.cc
+@@ -34,6 +34,7 @@
+ #include "simple_video_view.h"
+ #include "wx_util.h"
+ #include "lib/butler.h"
++#include "lib/constants.h"
+ #include "lib/config.h"
+ #include "lib/dcp_content.h"
+ #include "lib/dcpomatic_log.h"
+@@ -60,6 +61,7 @@ extern "C" {
+ LIBDCP_DISABLE_WARNINGS
+ #include <wx/tglbtn.h>
+ LIBDCP_ENABLE_WARNINGS
++#include <algorithm>
+ #include <iomanip>
+ 
+ 
+@@ -243,11 +245,33 @@ FilmViewer::create_butler()
+ 
+ 	auto& audio = AudioBackend::instance()->rtaudio();
+ 
++	AudioMapping mapping;
++	int audio_channels;
++	_inspect_dcp_channels = 0;
++
++	if (_inspector_active.load() && _film->audio_channels() > 0 && _audio_channels > 0) {
++		auto const dcp_channels = std::min(_film->audio_channels(), MAX_DCP_AUDIO_CHANNELS);
++		_inspect_dcp_channels = dcp_channels;
++
++		AudioMapping identity(MAX_DCP_AUDIO_CHANNELS, dcp_channels);
++		identity.make_zero();
++		for (int i = 0; i < dcp_channels; ++i) {
++			identity.set(i, i, 1.0f);
++		}
++
++		mapping = identity;
++		audio_channels = dcp_channels;
++		_inspector.configure(dcp_channels, _audio_channels, _audio_block_size);
++	} else {
++		mapping = Config::instance()->audio_mapping(_audio_channels);
++		audio_channels = _audio_channels;
++	}
++
+ 	_butler = std::make_shared<Butler>(
+ 		_film,
+ 		*_player,
+-		Config::instance()->audio_mapping(_audio_channels),
+-		_audio_channels,
++		mapping,
++		audio_channels,
+ 		AV_PIX_FMT_RGB24,
+ 		VideoRange::FULL,
+ 		(opengl && _optimisation != Optimisation::NONE) ? Image::Alignment::COMPACT : Image::Alignment::PADDED,
+@@ -258,10 +282,63 @@ FilmViewer::create_butler()
+ 
+ 	_closed_captions_dialog->set_butler(_butler);
+ 
++	if (_inspect_dcp_channels > 0) {
++		inspector_recompute_matrix();
++	}
++
+ 	resume();
+ }
+ 
+ 
++void
++FilmViewer::inspector_set_active(bool active)
++{
++	if (_inspector_active.load() == active) {
++		return;
++	}
++
++	_inspector_active.store(active);
++	if (!active) {
++		_inspector.clear();
++	}
++
++	destroy_and_maybe_create_butler();
++}
++
++
++void
++FilmViewer::inspector_recompute_matrix()
++{
++	if (_inspect_dcp_channels <= 0 || _audio_channels <= 0) {
++		return;
++	}
++
++	ChannelInspector::Matrix matrix;
++	for (auto& row: matrix.gain) {
++		for (auto& value: row) {
++			value = 0.0f;
++		}
++	}
++
++	auto const mapping = Config::instance()->audio_mapping(_audio_channels);
++	auto const input_channels = std::min(_inspect_dcp_channels, mapping.input_channels());
++	auto const output_channels = std::min(_audio_channels, mapping.output_channels());
++	auto const soloing = _inspector.has_solo();
++
++	for (int input = 0; input < input_channels; ++input) {
++		if ((soloing && !_inspector.solo(input)) || _inspector.mute(input)) {
++			continue;
++		}
++
++		for (int output = 0; output < output_channels; ++output) {
++			matrix.gain[input][output] = mapping.get(input, output);
++		}
++	}
++
++	_inspector.publish(matrix);
++}
++
++
+ void
+ FilmViewer::set_outline_content(bool o)
+ {
+@@ -738,13 +815,28 @@ FilmViewer::audio_callback(void* out_p, unsigned int frames)
+ 		_stream_time = audio.getStreamTime();
+ 	}
+ 
+-	while (true) {
+-		auto t = _butler->get_audio(Butler::Behaviour::NON_BLOCKING, reinterpret_cast<float*>(out_p), frames);
+-		if (!t || DCPTime(uncorrected_time() - *t) < one_video_frame()) {
+-			/* There was an underrun or this audio is on time; carry on */
+-			break;
++	if (_inspector_active.load() && _inspector.can_process(frames)) {
++		auto mid = _inspector.mid_buffer();
++		while (true) {
++			auto t = _butler->get_audio(Butler::Behaviour::NON_BLOCKING, mid, frames);
++			if (!t || DCPTime(uncorrected_time() - *t) < one_video_frame()) {
++				break;
++			}
++		}
++
++		_inspector.meter(mid, frames);
++		_inspector.downmix(mid, reinterpret_cast<float*>(out_p), frames);
++	} else if (_inspector_active.load()) {
++		std::fill_n(reinterpret_cast<float*>(out_p), static_cast<std::size_t>(frames) * _audio_channels, 0.0f);
++	} else {
++		while (true) {
++			auto t = _butler->get_audio(Butler::Behaviour::NON_BLOCKING, reinterpret_cast<float*>(out_p), frames);
++			if (!t || DCPTime(uncorrected_time() - *t) < one_video_frame()) {
++				/* There was an underrun or this audio is on time; carry on */
++				break;
++			}
++			/* The audio we just got was (very) late; drop it and get some more. */
+ 		}
+-		/* The audio we just got was (very) late; drop it and get some more. */
+ 	}
+ 
+ 	if (auto lm = boost::mutex::scoped_lock(_latency_history_mutex, boost::try_to_lock)) {
+diff --git a/src/wx/film_viewer.h b/src/wx/film_viewer.h
+index 6d08df3..f78d2a3 100644
+--- a/src/wx/film_viewer.h
++++ b/src/wx/film_viewer.h
+@@ -24,8 +24,13 @@
+  */
+ 
+ 
++#ifndef DCPOMATIC_FILM_VIEWER_H
++#define DCPOMATIC_FILM_VIEWER_H
++
++
+ #include "optimisation.h"
+ #include "video_view.h"
++#include "channel_inspector.h"
+ #include "lib/change_signaller.h"
+ #include "lib/config.h"
+ #include "lib/film_property.h"
+@@ -38,6 +43,7 @@ LIBDCP_DISABLE_WARNINGS
+ #include <RtAudio.h>
+ #include <wx/wx.h>
+ LIBDCP_ENABLE_WARNINGS
++#include <atomic>
+ #include <vector>
+ 
+ 
+@@ -126,6 +132,35 @@ public:
+ 
+ 	int audio_callback(void* out, unsigned int frames);
+ 
++	void inspector_set_active(bool active);
++	bool inspector_active() const {
++		return _inspector_active.load();
++	}
++	int inspector_dcp_channels() const {
++		return _inspect_dcp_channels;
++	}
++	void inspector_set_solo(int channel, bool active) {
++		_inspector.set_solo(channel, active);
++		inspector_recompute_matrix();
++	}
++	void inspector_set_mute(int channel, bool active) {
++		_inspector.set_mute(channel, active);
++		inspector_recompute_matrix();
++	}
++	void inspector_clear() {
++		_inspector.clear();
++		inspector_recompute_matrix();
++	}
++	bool inspector_solo(int channel) const {
++		return _inspector.solo(channel);
++	}
++	bool inspector_mute(int channel) const {
++		return _inspector.mute(channel);
++	}
++	float inspector_peak_dbfs(int channel) const {
++		return _inspector.peak_dbfs(channel);
++	}
++
+ 	StateTimer const & state_timer() const {
+ 		return _video_view->state_timer();
+ 	}
+@@ -183,6 +218,7 @@ private:
+ 	void destroy_butler();
+ 	void create_butler();
+ 	void destroy_and_maybe_create_butler();
++	void inspector_recompute_matrix();
+ 	void config_changed(Config::Property);
+ 	void film_length_change();
+ 	void ui_finished();
+@@ -200,6 +236,9 @@ private:
+ 	std::vector<int> _pending_player_changes;
+ 
+ 	int _audio_channels = 0;
++	ChannelInspector _inspector;
++	std::atomic<bool> _inspector_active{false};
++	int _inspect_dcp_channels = 0;
+ 	unsigned int _audio_block_size = 1024;
+ 	bool _playing = false;
+ 	int _suspended = 0;
+@@ -242,3 +281,6 @@ private:
+ 
+ 	boost::signals2::scoped_connection _config_changed_connection;
+ };
++
++
++#endif

@@ -1,43 +1,106 @@
-# RoomTune (가칭)
+# DCP-o-matic Player Channel Inspector
 
-> **영화(DCP) 재생을 정밀하게 — 룸튜닝 솔루션**
-> 아이폰을 계측기로, DCP-o-matic Player를 소프트웨어 B-chain으로 삼아, 상영/마스터링 룸의 청취를 보정하는 프로젝트.
+Monitor-only audio channel inspection patch for DCP-o-matic Player.
 
-**상태:** 🔒 비공개(private) · 기획·리서치·빌드계획 단계 · 실제 빌드/구현 착수 전
-**리그:** M4 Max Mac Studio (macOS 26.5.1) + iPhone 16
+This repository branch is scoped to one upstreamable feature: add a
+`Tools > Channel inspector...` window to DCP-o-matic Player so a user can
+listen to individual DCP audio channels and verify channel activity during
+playback.
 
----
+No room tuning, playback EQ, measurement workflow, DKDM/libxml fix, or export
+path change is part of this branch.
 
-## 이게 뭔가
+## Feature Summary
 
-방(room)은 특히 저역에서 소리를 15~25dB까지 왜곡한다(룸모드). 이 프로젝트는 그 방의 응답을 측정하고, 음향학적으로 타당한 EQ 보정(피크 컷 중심, X-curve 타깃)을 **DCP-o-matic Player의 영화 출력에 적용**하는 것을 목표로 한다. 즉 극장의 B-chain 프로세서를 소프트웨어(또는 하드웨어 DSP)로 구현한다.
+| Area | Behavior |
+|---|---|
+| Target app | DCP-o-matic Player v2.18.44 |
+| UI entry | `Tools > Channel inspector...` |
+| Controls | Per-DCP-channel `Solo` and `Mute` checkboxes |
+| Metering | Per-DCP-channel peak level display in dBFS |
+| Playback scope | Monitor-only; affects Player listening output while the window is open |
+| DCP scope | Does not modify CPLs, assets, export output, or encoded DCP data |
+| Channel support | Up to 16 DCP channels and up to 16 output-device channels |
+| Routing | Solo-in-place: selected channels keep the normal configured output mapping |
 
-- **측정(두뇌):** 아이폰(내장/USB-C 계측마이크) 또는 REW+UMIK로 룸 응답 측정 → 채널별 보정 계산
-- **적용(경로, 결정 중):** DCP-o-matic 포크(재생 콜백에 EQ 삽입) **또는** 하드웨어 DSP(miniDSP)
+## Files
 
-## 왜 시스템 전역 EQ가 아닌가
+| Path | Purpose |
+|---|---|
+| `patches/dcpomatic-channel-inspector/0001-add-monitor-only-channel-inspector.patch` | Patch to apply to clean DCP-o-matic v2.18.44 source |
+| `patches/dcpomatic-channel-inspector/channel_inspector.h` | Header-only realtime inspection engine copy for review/testing |
+| `patches/dcpomatic-channel-inspector/channel_inspector_dialog.h` | Header-only wx UI copy for review |
+| `patches/dcpomatic-channel-inspector/tests/inspector_harness.cc` | Small standalone engine smoke test |
+| `docs/channel-inspector-review.md` | Aggressive review report and remaining PR-readiness notes |
 
-실제 니즈는 "DCP-o-matic 영화 출력만 정밀하게"이며, 시스템 전역 EQ는 과하다. 코딩 없는 per-app 도구(Audio Hijack류)는 **스테레오 파이프라인 한계**로 5.1/7.1 디스크리트 B-chain에 부적합하다. 그래서 채널이 이미 분리된 **DCP-o-matic 재생 경로에 직접 EQ를 삽입**하는 방향이 유력하다(수출 DCP에는 영향 없음).
+## Architecture
 
-## 현재 결정점 (게이트)
+```mermaid
+flowchart TD
+    A["DCP-o-matic Player"] --> B["Butler"]
+    B --> C{"Inspector open?"}
+    C -- "No" --> D["Existing Config audio mapping"]
+    C -- "Yes" --> E["Identity Butler output in DCP channel layout"]
+    E --> F["ChannelInspector preallocated mid buffer"]
+    F --> G["Peak meter before mute/downmix"]
+    G --> H["Atomic monitor matrix"]
+    H --> I["Device output buffer"]
+    D --> I
+    I --> J["Audio device"]
+```
 
-**macOS에서 DCP-o-matic 소스빌드가 되는가?** → 되면 포크 확정, 안 되면 하드웨어 DSP로 선회.
-자세한 내용: [docs/DCP-o-matic-빌드계획.md](docs/DCP-o-matic-빌드계획.md)
+## Apply And Build
 
-## 문서
+```bash
+cd ~/src/dcpomatic
+git checkout v2.18.44
+git apply /Users/homedcp/Claude/Projects/roomtunning/patches/dcpomatic-channel-inspector/0001-add-monitor-only-channel-inspector.patch
+python3 ./waf configure --prefix=$HOME/dcpomatic-env --wx-config="$(brew --prefix wxwidgets)/bin/wx-config" --c++17 --disable-tests
+python3 ./waf build
+```
 
-| 문서 | 내용 |
-|------|------|
-| [프로젝트-히스토리.md](docs/프로젝트-히스토리.md) | 진행 서사 + 의사결정 로그 |
-| [리서치-종합.md](docs/리서치-종합.md) | 전 과정 딥리서치 요약(검증 포함) |
-| [DCP-o-matic-빌드계획.md](docs/DCP-o-matic-빌드계획.md) | macOS 소스빌드 계획(현재 활성 트랙) |
-| [개발명세서.md](docs/개발명세서.md) | 초기 iPhone+Mac 앱 명세(측정 파이프라인 부분 유효) |
-| [개발환경-셋업가이드.md](docs/개발환경-셋업가이드.md) | iOS/macOS 개발환경(리그별) |
-| [공개전환-체크리스트.md](docs/공개전환-체크리스트.md) | 레포 공개 전환 준비 |
+The focused build and usage guide is
+`docs/channel-inspector-build-and-use.md`.
 
-## 라이선스
+## Use
 
-미정(보류). 결과물이 **DCP-o-matic(GPL-2.0-or-later) 파생물**이 되면 배포 시 GPL-2.0-or-later로 소스 공개 의무가 발생한다. 공개 전환 시 확정. [docs/공개전환-체크리스트.md](docs/공개전환-체크리스트.md) §1 참조.
+1. Open a DCP in DCP-o-matic Player.
+2. Start playback.
+3. Open `Tools > Channel inspector...`.
+4. Use `Solo` to isolate one or more DCP channels while preserving the normal
+   output mapping.
+5. Use `Mute` to remove individual channels from the monitor output.
+6. Watch the `Peak` column to confirm whether each DCP channel has signal.
+7. Close the window to reset solo/mute state and return to the normal playback
+   path.
 
----
-*이 프로젝트는 [DCP-o-matic](https://dcpomatic.com/)(© Carl Hetherington, GPL) 을 기반/컴패니언으로 한다.*
+## Verification
+
+Current branch checks:
+
+```bash
+clang++ -std=c++17 -I patches/dcpomatic-channel-inspector \
+  patches/dcpomatic-channel-inspector/tests/inspector_harness.cc \
+  -o /tmp/dcpomatic_channel_inspector_harness
+/tmp/dcpomatic_channel_inspector_harness
+```
+
+Observed result: `ALL PASS (0 failures)`.
+
+Additional checks completed:
+
+| Check | Result |
+|---|---|
+| Patch contains no `Room`, `EQ`, `REW`, `X-curve`, `DKDM`, `roomtune`, or `RoomTune` strings | PASS |
+| `git apply --check` against clean local DCP-o-matic v2.18.44 source | PASS |
+| Full DCP-o-matic `python3 ./waf build` in a clean temp source tree | PASS, `[518/518] dcpomatic2_player` linked |
+
+## PR Scope
+
+Proposed PR title:
+
+`Add monitor-only audio channel inspector to Player`
+
+One-line scope:
+
+`This adds a Player-only Channel inspector window for per-channel solo/mute monitoring and dBFS peak checks without changing DCP content or export output.`

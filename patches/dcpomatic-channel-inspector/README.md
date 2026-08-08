@@ -55,7 +55,8 @@ to both L/R in stereo monitoring, soloing C keeps that same monitor placement.
 ```bash
 cd ~/src/dcpomatic
 git checkout v2.18.44
-git apply /Users/homedcp/Claude/Projects/roomtunning/patches/dcpomatic-channel-inspector/0001-add-monitor-only-channel-inspector.patch
+CHANNEL_INSPECTOR_REPO=/Users/homedcp/Claude/Projects/dcpomatic-channel-inspector
+git apply "$CHANNEL_INSPECTOR_REPO/patches/dcpomatic-channel-inspector/0001-add-monitor-only-channel-inspector.patch"
 ```
 
 ## Build On macOS
@@ -96,3 +97,9 @@ Expected result:
 ```text
 == ALL PASS (0 failures) ==
 ```
+
+## License
+
+The patch is intended for contribution to DCP-o-matic and follows the same
+GPL-2.0-or-later licensing notice used by the DCP-o-matic source files it
+modifies. See the repository root `LICENSE` file for the full GPL v2 text.

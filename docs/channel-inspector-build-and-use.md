@@ -35,13 +35,14 @@ Notes:
 From the clean DCP-o-matic checkout:
 
 ```bash
-git apply /Users/homedcp/Claude/Projects/roomtunning/patches/dcpomatic-channel-inspector/0001-add-monitor-only-channel-inspector.patch
+CHANNEL_INSPECTOR_REPO=/Users/homedcp/Claude/Projects/dcpomatic-channel-inspector
+git apply "$CHANNEL_INSPECTOR_REPO/patches/dcpomatic-channel-inspector/0001-add-monitor-only-channel-inspector.patch"
 ```
 
 Optional preflight:
 
 ```bash
-git apply --check /Users/homedcp/Claude/Projects/roomtunning/patches/dcpomatic-channel-inspector/0001-add-monitor-only-channel-inspector.patch
+git apply --check "$CHANNEL_INSPECTOR_REPO/patches/dcpomatic-channel-inspector/0001-add-monitor-only-channel-inspector.patch"
 ```
 
 ## 4. Build

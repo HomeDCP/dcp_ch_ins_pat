@@ -54,7 +54,8 @@ flowchart TD
 ```bash
 cd ~/src/dcpomatic
 git checkout v2.18.44
-git apply /Users/homedcp/Claude/Projects/roomtunning/patches/dcpomatic-channel-inspector/0001-add-monitor-only-channel-inspector.patch
+CHANNEL_INSPECTOR_REPO=/Users/homedcp/Claude/Projects/dcpomatic-channel-inspector
+git apply "$CHANNEL_INSPECTOR_REPO/patches/dcpomatic-channel-inspector/0001-add-monitor-only-channel-inspector.patch"
 python3 ./waf configure --prefix=$HOME/dcpomatic-env --wx-config="$(brew --prefix wxwidgets)/bin/wx-config" --c++17 --disable-tests
 python3 ./waf build
 ```
@@ -104,3 +105,11 @@ Proposed PR title:
 One-line scope:
 
 `This adds a Player-only Channel inspector window for per-channel solo/mute monitoring and dBFS peak checks without changing DCP content or export output.`
+
+## License
+
+This repository carries a patch intended for contribution to DCP-o-matic.
+DCP-o-matic source files use the GNU General Public License as published by the
+Free Software Foundation, either version 2 of the License, or at your option any
+later version. The new patch files follow that same GPL-2.0-or-later licensing
+notice, and the full GPL v2 text is included in `LICENSE`.

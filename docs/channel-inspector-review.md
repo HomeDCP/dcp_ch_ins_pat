@@ -68,17 +68,17 @@ sequenceDiagram
 | Priority | Item | Recommendation |
 |---|---|---|
 | P0 | Manual playback QA | Test a 5.1 DCP on stereo output and, if available, a multichannel device |
-| P0 | Legacy branch cleanup | Remove old room-tuning/EQ/DKDM files from the final PR branch once explicit deletion approval is available |
+| Done | Legacy branch cleanup | Old room-tuning/EQ/DKDM files were removed from the PR branch after explicit approval |
 | P1 | Upstream style polish | Consider moving `ChannelInspectorDialog` implementation to `.cc` if upstream dislikes large header-only wx classes |
 | P1 | UX wording | Confirm whether the menu label should be `Channel inspector...`, `Audio channel inspector...`, or another existing DCP-o-matic style |
 | P2 | Meter behavior | Peak has no decay/hold; acceptable for v1, but note it in PR if asked |
 
-## Legacy Files To Remove From The Final PR Branch
+## Legacy Files Removed From The PR Branch
 
 The active monitor-only patch and documentation live under
 `patches/dcpomatic-channel-inspector/` plus this branch README and design docs.
-The following older files are still present in the repository history/worktree
-but should not be part of an upstream Channel inspector PR:
+The following older files were removed because they should not be part of an
+upstream Channel inspector PR:
 
 | Path | Reason |
 |---|---|
@@ -91,6 +91,11 @@ but should not be part of an upstream Channel inspector PR:
 | `docs/개발환경-셋업가이드.md` | Earlier room tuning app setup guide |
 | `docs/리서치-종합.md` | Broad room tuning research |
 | `docs/DCP-o-matic-빌드계획.md` | Earlier build-gate plan for a room tuning fork |
+| `docs/DCP-o-matic-빌드-실전기록.md` | Earlier local build record tied to the old project |
+| `docs/DCP-o-matic-소스빌드-활용가이드.md` | Earlier broad source-build guide |
+| `docs/공개전환-체크리스트.md` | Earlier repository-publication checklist |
+| `docs/도구-재사용-안내.md` | Earlier local tooling guide |
+| `docs/프로젝트-히스토리.md` | Earlier project history |
 | `scripts/roomtune-env.sh` | RoomTune-named local build environment helper |
 | `scripts/roomtune-tools.env.sh` | Stock-vs-EQ local helper script |
 

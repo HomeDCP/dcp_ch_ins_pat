@@ -73,6 +73,41 @@ int main()
 	inspector.clear();
 	check("clear resets solo and mute", !inspector.has_solo() && !inspector.mute(4));
 
+	ChannelInspector wide;
+	wide.configure(2, 18, 4);
+	check("wide device clamps monitor columns", wide.device_channels() == ChannelInspector::MAX_DEV);
+
+	ChannelInspector::Matrix wide_matrix;
+	for (auto& row: wide_matrix.gain) {
+		for (auto& gain: row) {
+			gain = 0.0f;
+		}
+	}
+	wide_matrix.gain[0][0] = 1.0f;
+	wide_matrix.gain[1][15] = 1.0f;
+	wide.publish(wide_matrix);
+
+	std::vector<float> wide_mid(2 * 2, 0.0f);
+	std::vector<float> wide_out(2 * 18, -99.0f);
+	wide_mid[0] = 1.0f;
+	wide_mid[1] = 2.0f;
+	wide_mid[2] = 3.0f;
+	wide_mid[3] = 4.0f;
+	wide.downmix(wide_mid.data(), wide_out.data(), 2);
+
+	bool wide_stride_ok = true;
+	for (int frame = 0; frame < 2; ++frame) {
+		auto const base = frame * 18;
+		wide_stride_ok = wide_stride_ok && std::fabs(wide_out[base] - wide_mid[frame * 2]) < 1e-5f;
+		wide_stride_ok = wide_stride_ok && std::fabs(wide_out[base + 15] - wide_mid[frame * 2 + 1]) < 1e-5f;
+		for (int channel = 1; channel < 18; ++channel) {
+			if (channel != 15) {
+				wide_stride_ok = wide_stride_ok && std::fabs(wide_out[base + channel]) < 1e-5f;
+			}
+		}
+	}
+	check("wide device uses actual output stride", wide_stride_ok);
+
 	std::printf("\n== %s (%d failure%s) ==\n", failures == 0 ? "ALL PASS" : "FAIL", failures, failures == 1 ? "" : "s");
 	return failures == 0 ? 0 : 1;
 }

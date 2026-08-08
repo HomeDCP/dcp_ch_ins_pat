@@ -56,6 +56,7 @@ public:
 	{
 		_dcp_channels = std::max(0, std::min(dcp_channels, MAX_DCP));
 		_device_channels = std::max(0, std::min(device_channels, MAX_DEV));
+		_output_channels = std::max(0, device_channels);
 		_mid_frames = block_size;
 		_mid.assign(static_cast<std::size_t>(block_size) * MAX_DCP, 0.0f);
 		for (auto& peak: _peak) {
@@ -65,7 +66,7 @@ public:
 
 	bool active_pipeline() const
 	{
-		return _dcp_channels > 0 && _device_channels > 0 && !_mid.empty();
+		return _dcp_channels > 0 && _device_channels > 0 && _output_channels > 0 && !_mid.empty();
 	}
 
 	bool can_process(unsigned int frames) const
@@ -106,9 +107,9 @@ public:
 	{
 		for (unsigned int f = 0; f < frames; ++f) {
 			auto const in = mid + static_cast<std::size_t>(f) * _dcp_channels;
-			auto o = out + static_cast<std::size_t>(f) * _device_channels;
+			auto o = out + static_cast<std::size_t>(f) * _output_channels;
 
-			for (int j = 0; j < _device_channels; ++j) {
+			for (int j = 0; j < _output_channels; ++j) {
 				o[j] = 0.0f;
 			}
 
@@ -197,6 +198,7 @@ private:
 
 	int _dcp_channels = 0;
 	int _device_channels = 0;
+	int _output_channels = 0;
 	unsigned int _mid_frames = 0;
 	std::vector<float> _mid;
 	std::atomic<float> _peak[MAX_DCP];

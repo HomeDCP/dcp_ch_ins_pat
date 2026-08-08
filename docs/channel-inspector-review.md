@@ -20,6 +20,8 @@ this branch.
 | Header-only engine build | Fixed | `static constexpr` constants remove the previous link failure |
 | Realtime matrix handoff | Fixed | Replaced two-slot mutable matrix handoff with atomic gain cells |
 | Callback buffer bounds | Fixed | Callback uses inspector path only when `frames <= configured block size`; otherwise emits silence while active |
+| Inspector shutdown ordering | Fixed | Stops the Butler before clearing active inspector mode, avoiding a transient identity-output/channel-count mismatch in the audio callback |
+| Wide output devices | Fixed | Clamps monitor matrix columns to 16 while preserving the actual audio-device output stride |
 | DCP-o-matic build | Pass | Full clean temp-tree `waf build` completed through `dcpomatic2_player` |
 | Manual GUI/audio QA | Still needed | Requires actual DCP playback and speaker/headphone monitoring |
 
@@ -58,6 +60,8 @@ sequenceDiagram
 | Two-slot matrix publication was unsafe | GUI could overwrite the slot read by the audio callback | Replaced double-buffer matrix with per-cell `std::atomic<float>` |
 | `_inspector_active` was shared across threads | Plain bool read by callback and written by UI thread | Changed to `std::atomic<bool>` |
 | Mid-buffer capacity was assumed | Callback ignored blocks larger than the configured buffer | Added `can_process(frames)` guard and silent output fallback while inspector is active |
+| Inspector close could briefly mismatch Butler/output widths | Active flag could become false before the identity Butler was destroyed, letting the normal callback path read DCP-width audio into a device-width buffer | Stop/destroy the Butler before changing active state and recreating it |
+| 17+ output-channel devices could exceed matrix width | `_audio_channels` could drive writes past the 16-column monitor matrix and use a clamped stride in the callback | Clamp matrix columns to `ChannelInspector::MAX_DEV`, store the actual output stride separately, and add a standalone regression case |
 
 ### Remaining Before PR
 

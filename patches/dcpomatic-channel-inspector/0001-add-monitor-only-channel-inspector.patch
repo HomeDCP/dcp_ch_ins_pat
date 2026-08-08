@@ -63,7 +63,7 @@ new file mode 100644
 index 0000000..ad71d4d
 --- /dev/null
 +++ b/src/wx/channel_inspector.h
-@@ -0,0 +1,209 @@
+@@ -0,0 +1,211 @@
 +/*
 +    Copyright (C) 2026
 +
@@ -122,6 +122,7 @@ index 0000000..ad71d4d
 +	{
 +		_dcp_channels = std::max(0, std::min(dcp_channels, MAX_DCP));
 +		_device_channels = std::max(0, std::min(device_channels, MAX_DEV));
++		_output_channels = std::max(0, device_channels);
 +		_mid_frames = block_size;
 +		_mid.assign(static_cast<std::size_t>(block_size) * MAX_DCP, 0.0f);
 +		for (auto& peak: _peak) {
@@ -131,7 +132,7 @@ index 0000000..ad71d4d
 +
 +	bool active_pipeline() const
 +	{
-+		return _dcp_channels > 0 && _device_channels > 0 && !_mid.empty();
++		return _dcp_channels > 0 && _device_channels > 0 && _output_channels > 0 && !_mid.empty();
 +	}
 +
 +	bool can_process(unsigned int frames) const
@@ -172,9 +173,9 @@ index 0000000..ad71d4d
 +	{
 +		for (unsigned int f = 0; f < frames; ++f) {
 +			auto const in = mid + static_cast<std::size_t>(f) * _dcp_channels;
-+			auto o = out + static_cast<std::size_t>(f) * _device_channels;
++			auto o = out + static_cast<std::size_t>(f) * _output_channels;
 +
-+			for (int j = 0; j < _device_channels; ++j) {
++			for (int j = 0; j < _output_channels; ++j) {
 +				o[j] = 0.0f;
 +			}
 +
@@ -263,6 +264,7 @@ index 0000000..ad71d4d
 +
 +	int _dcp_channels = 0;
 +	int _device_channels = 0;
++	int _output_channels = 0;
 +	unsigned int _mid_frames = 0;
 +	std::vector<float> _mid;
 +	std::atomic<float> _peak[MAX_DCP];
@@ -507,7 +509,7 @@ index dcee453..4f2004f 100644
  		AV_PIX_FMT_RGB24,
  		VideoRange::FULL,
  		(opengl && _optimisation != Optimisation::NONE) ? Image::Alignment::COMPACT : Image::Alignment::PADDED,
-@@ -258,10 +282,63 @@ FilmViewer::create_butler()
+@@ -258,10 +282,72 @@ FilmViewer::create_butler()
  
  	_closed_captions_dialog->set_butler(_butler);
  
@@ -526,12 +528,21 @@ index dcee453..4f2004f 100644
 +		return;
 +	}
 +
-+	_inspector_active.store(active);
-+	if (!active) {
++	destroy_butler();
++
++	if (active) {
++		_inspector_active.store(true);
++	} else {
 +		_inspector.clear();
++		_inspector_active.store(false);
 +	}
 +
-+	destroy_and_maybe_create_butler();
++	if (!_film) {
++		resume();
++		return;
++	}
++
++	create_butler();
 +}
 +
 +
@@ -551,7 +562,7 @@ index dcee453..4f2004f 100644
 +
 +	auto const mapping = Config::instance()->audio_mapping(_audio_channels);
 +	auto const input_channels = std::min(_inspect_dcp_channels, mapping.input_channels());
-+	auto const output_channels = std::min(_audio_channels, mapping.output_channels());
++	auto const output_channels = std::min(ChannelInspector::MAX_DEV, std::min(_audio_channels, mapping.output_channels()));
 +	auto const soloing = _inspector.has_solo();
 +
 +	for (int input = 0; input < input_channels; ++input) {
